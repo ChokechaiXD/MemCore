@@ -427,11 +427,14 @@ def deactivate(conn, memory_id, agent_id, reason=None):
             raise MemCoreError(
                 f'cannot deactivate terminal memory (lifecycle={lifecycle})'
             )
+        if lifecycle == 'disabled':
+            raise MemCoreError('memory is already disabled')
         conn.execute(
             "UPDATE memory SET lifecycle='disabled', updated_at=? WHERE id=?",
             (_now(), memory_id)
         )
-        _audit(conn, 'deactivate', agent_id, memory_id, project_id, {'reason': reason})
+        _audit(conn, 'deactivate', agent_id, memory_id, project_id,
+               {'reason': reason, 'previous_lifecycle': lifecycle})
         conn.execute('COMMIT')
     except Exception:
         try:
@@ -442,7 +445,7 @@ def deactivate(conn, memory_id, agent_id, reason=None):
 
 
 def restore(conn, memory_id, agent_id):
-    """Undo deactivate: disabled -> candidate."""
+    """Undo disable, restoring the lifecycle that was disabled when known."""
     conn.execute('BEGIN IMMEDIATE')
     try:
         project_id, scope, owner, lifecycle, role = _require_memory_write_access(
@@ -463,11 +466,26 @@ def restore(conn, memory_id, agent_id):
         )
         if blocked:
             raise TombstoneBlocked(fingerprint(content), blocked[0])
+        target_lifecycle = 'candidate'
+        event = conn.execute(
+            "SELECT action, detail FROM audit_event WHERE memory_id=? "
+            "AND action IN ('deactivate','disable','gc_disable') "
+            "ORDER BY id DESC LIMIT 1",
+            (memory_id,)
+        ).fetchone()
+        if event and event[0] in ('deactivate', 'disable'):
+            try:
+                previous = json.loads(event[1] or '{}').get('previous_lifecycle')
+            except (TypeError, ValueError, json.JSONDecodeError):
+                previous = None
+            if previous in ('candidate', 'accepted', 'conflict'):
+                target_lifecycle = previous
         conn.execute(
-            "UPDATE memory SET lifecycle='candidate', updated_at=? WHERE id=?",
-            (_now(), memory_id)
+            'UPDATE memory SET lifecycle=?, updated_at=? WHERE id=?',
+            (target_lifecycle, _now(), memory_id)
         )
-        _audit(conn, 'restore', agent_id, memory_id, project_id, {})
+        _audit(conn, 'restore', agent_id, memory_id, project_id,
+               {'restored_lifecycle': target_lifecycle})
         conn.execute('COMMIT')
     except Exception:
         try:

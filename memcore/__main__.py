@@ -355,6 +355,20 @@ def cmd_deactivate(args):
         conn.close()
 
 
+def cmd_restore(args):
+    conn = _open(args)
+    try:
+        agent_id, exists = _agent_identity_or_exit(conn, args.agent)
+        if not exists:
+            sys.exit(f'error: agent {agent_id} does not exist; create it first')
+        core.restore(conn, args.memory_id, agent_id)
+        print(f'restored: {args.memory_id}')
+    except core.MemCoreError as e:
+        sys.exit(f'error: {e}')
+    finally:
+        conn.close()
+
+
 def cmd_reject(args):
     conn = _open(args)
     try:
@@ -829,6 +843,11 @@ def main(argv=None):
     p.add_argument('memory_id')
     p.add_argument('--agent', required=True)
     p.set_defaults(func=cmd_deactivate)
+
+    p = sub.add_parser('restore', help='restore a disabled memory')
+    p.add_argument('memory_id')
+    p.add_argument('--agent', required=True)
+    p.set_defaults(func=cmd_restore)
 
     p = sub.add_parser('reject', help='reject a memory and create a tombstone')
     p.add_argument('memory_id')

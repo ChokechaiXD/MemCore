@@ -942,6 +942,37 @@ class TestSupersedeAndDeactivate(CoreTestBase):
             'SELECT lifecycle FROM memory WHERE id=?', (mem_id,)
         ).fetchone()
         self.assertEqual(row[0], 'candidate')
+    def test_deactivate_restore_preserves_previous_lifecycle(self):
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, 'accepted reversible memory', scope='project'
+        )
+        self.conn.execute("UPDATE memory SET lifecycle='accepted' WHERE id=?", (mem_id,))
+        core.deactivate(self.conn, mem_id, self.alice, reason='temporary hide')
+        detail = self.conn.execute(
+            "SELECT detail FROM audit_event WHERE memory_id=? AND action='deactivate' ORDER BY id DESC LIMIT 1",
+            (mem_id,)
+        ).fetchone()[0]
+        self.assertIn('accepted', detail)
+        core.restore(self.conn, mem_id, self.alice)
+        lifecycle = self.conn.execute(
+            'SELECT lifecycle FROM memory WHERE id=?', (mem_id,)
+        ).fetchone()[0]
+        self.assertEqual(lifecycle, 'accepted')
+
+    def test_repeated_deactivate_cannot_overwrite_restore_state(self):
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, 'double deactivate guard', scope='project'
+        )
+        self.conn.execute("UPDATE memory SET lifecycle='conflict' WHERE id=?", (mem_id,))
+        core.deactivate(self.conn, mem_id, self.alice)
+        with self.assertRaises(core.MemCoreError):
+            core.deactivate(self.conn, mem_id, self.alice)
+        core.restore(self.conn, mem_id, self.alice)
+        lifecycle = self.conn.execute(
+            'SELECT lifecycle FROM memory WHERE id=?', (mem_id,)
+        ).fetchone()[0]
+        self.assertEqual(lifecycle, 'conflict')
+
 
 
 class TestSearch(CoreTestBase):

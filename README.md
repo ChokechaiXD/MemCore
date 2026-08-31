@@ -31,7 +31,7 @@ cd C:\Users\BlankScreen\Workspace\memcore
 python -m unittest discover -v
 ```
 
-Current full core gate: 148 tests pass, with the E12 token-budget pair remaining expected failures.
+Current full core gate: 151 tests pass, with the E12 token-budget pair remaining expected failures.
 The E12 token-budget pair remains an expected failure in the core harness
 because prompt-size enforcement lives in the Hermes plugin's recall builder.
 The plugin has its own budget regression tests.
@@ -43,6 +43,7 @@ python -m memcore doctor
 python -m memcore stats
 python -m memcore gc
 python -m memcore gc --apply
+python -m memcore restore <memory_id> --agent mika
 python -m memcore tombstone override <tombstone_id> --agent pchoke
 python -m memcore import --file batch.json --agent mika --project shared-platform --dry-run
 python -m memcore import --file batch.json --agent mika --project shared-platform
@@ -62,5 +63,6 @@ and each memory plus all evidence links commits atomically as one item.
 - Private memory is writable only by its owner or a project owner.
 - Plugin-bound mutations cannot target another project by memory ID.
 - Rejected/corrected claims create scope-aware tombstones that block silent resurrection; explicit override is owner-audited and does not resurrect the old rejected row.
+- Deactivate/restore is reversible: accepted/conflict/candidate lifecycle is preserved across manual disable/restore.
 - Search ranking is deterministic and exposes lifecycle, verification, and freshness rather than treating candidate memory as verified fact.
 - Search returns only the current memory version; history remains queryable.

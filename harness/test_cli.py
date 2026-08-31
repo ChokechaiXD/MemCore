@@ -260,6 +260,25 @@ class CliImportTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_cli_restore_roundtrips_disabled_memory(self):
+        conn = store.open_store(self.db)
+        conn.execute("INSERT INTO agent (id,name,profile_key) VALUES ('agent-owner','owner','owner')")
+        conn.execute("INSERT INTO project_membership VALUES ('proj-demo','agent-owner','owner',datetime('now'))")
+        mem_id, _ = core.create_memory(
+            conn, 'proj-demo', 'agent-owner', 'cli reversible accepted memory', scope='project'
+        )
+        conn.execute("UPDATE memory SET lifecycle='accepted' WHERE id=?", (mem_id,))
+        core.deactivate(conn, mem_id, 'agent-owner')
+        conn.close()
+        cli.main(['--db', self.db, 'restore', mem_id, '--agent', 'owner'])
+        conn = store.open_store(self.db)
+        try:
+            self.assertEqual(conn.execute(
+                'SELECT lifecycle FROM memory WHERE id=?', (mem_id,)
+            ).fetchone()[0], 'accepted')
+        finally:
+            conn.close()
+
     def test_mutation_cli_rejects_agent_identity_collision(self):
         conn = store.open_store(self.db)
         conn.execute("INSERT INTO agent (id,name,profile_key) VALUES ('agent-spoof','different','different')")
