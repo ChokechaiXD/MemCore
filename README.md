@@ -11,7 +11,7 @@ uses the Python standard library for the core engine.
 - Hermes integration: native `MemCoreMemoryProvider` is active as `memory.provider: memcore`.
 - Automatic Hermes lifecycle writes enter an append-only ingest journal first; raw journal rows are never recalled directly.
 - Canonical recall preserves scope/lifecycle/verification/freshness trust labels across profiles.
-- Schema contract remains frozen; revisions are applied through migrations. Current schema revision: `0008_ingest_journal`.
+- Schema contract remains frozen; revisions are applied through migrations. Current schema revision: `0009_semantic_analysis`.
 
 ## Repository layout
 

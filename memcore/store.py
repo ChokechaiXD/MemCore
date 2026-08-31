@@ -187,6 +187,23 @@ CREATE TABLE IF NOT EXISTS ingest_derivation (
 CREATE INDEX IF NOT EXISTS idx_ingest_derivation_memory ON ingest_derivation(memory_id);
 """
 
+_SEMANTIC_ANALYSIS = """
+CREATE TABLE IF NOT EXISTS ingest_analysis (
+    id                TEXT PRIMARY KEY,
+    event_id          TEXT NOT NULL REFERENCES ingest_event(id) ON DELETE CASCADE,
+    analyzer          TEXT NOT NULL,
+    verdict           TEXT NOT NULL CHECK (verdict IN ('remember','ignore','defer')),
+    candidate_content TEXT NOT NULL DEFAULT '',
+    confidence        REAL CHECK (confidence IS NULL OR (confidence >= 0.0 AND confidence <= 1.0)),
+    rationale         TEXT NOT NULL DEFAULT '',
+    metadata          TEXT NOT NULL DEFAULT '{}',
+    memory_id         TEXT REFERENCES memory(id),
+    created_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ingest_analysis_event ON ingest_analysis(event_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_ingest_analysis_analyzer ON ingest_analysis(analyzer, created_at);
+"""
+
 _INTEGRITY_HARDENING = """
 DROP TRIGGER IF EXISTS memory_version_created_at_iso;
 CREATE TRIGGER memory_version_created_at_iso BEFORE INSERT ON memory_version
@@ -220,6 +237,7 @@ CREATE INDEX IF NOT EXISTS idx_tombstone_fingerprint ON tombstone(claim_fingerpr
 """),
     ('0007_integrity_hardening', _INTEGRITY_HARDENING),
     ('0008_ingest_journal', _INGEST_JOURNAL),
+    ('0009_semantic_analysis', _SEMANTIC_ANALYSIS),
 ]
 
 

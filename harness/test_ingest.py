@@ -41,7 +41,8 @@ class TestIngestJournal(IngestTestBase):
         )}
         self.assertIn('ingest_event', names)
         self.assertIn('ingest_derivation', names)
-        self.assertEqual(store.MIGRATIONS[-1][0], '0008_ingest_journal')
+        self.assertIn('ingest_analysis', names)
+        self.assertEqual(store.MIGRATIONS[-1][0], '0009_semantic_analysis')
 
     def test_append_is_retry_safe(self):
         kwargs = dict(

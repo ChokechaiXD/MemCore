@@ -12,6 +12,8 @@ from . import core
 
 EVENT_TYPES = {'turn', 'memory_write', 'delegation', 'session_end', 'manual'}
 MAX_FIELD_CHARS = 65536
+MAX_ANALYSIS_CANDIDATE_CHARS = 4000
+SEMANTIC_VERDICTS = {'remember', 'ignore', 'defer'}
 
 _TRIVIAL_RE = re.compile(
     r'^(?:ok|okay|yes|no|thanks|thank you|hi|hey|hello|continue|next|done|'
@@ -108,6 +110,212 @@ def classify_user_text(text):
         candidate = _LEADING_REMEMBER_RE.sub('', text).strip() or text
         return 'candidate', 'explicit_durable_signal', candidate[:4000]
     return 'review', 'semantic_review_required', ''
+
+
+def pending_semantic_events(conn, project_id, agent_id, *, limit=20):
+    """Return this agent's pending semantic-review queue without cross-agent leakage."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0 or limit > 100:
+        raise core.MemCoreError('semantic review limit must be an integer from 1 to 100')
+    core._require_membership(conn, project_id, agent_id)
+    rows = conn.execute(
+        'SELECT id, event_type, user_content, assistant_content, metadata, decision, created_at '
+        'FROM ingest_event WHERE project_id=? AND agent_id=? AND status=\'pending\' '
+        "AND decision IN ('semantic_review_required','semantic_deferred') "
+        'ORDER BY created_at, id LIMIT ?',
+        (project_id, agent_id, limit)
+    ).fetchall()
+    results = []
+    for event_id, event_type, user_content, assistant_content, metadata_raw, decision, created_at in rows:
+        try:
+            metadata = json.loads(metadata_raw or '{}')
+        except (TypeError, ValueError, json.JSONDecodeError):
+            metadata = {}
+        results.append({
+            'event_id': event_id,
+            'event_type': event_type,
+            'user_content': user_content,
+            'assistant_content': assistant_content,
+            'metadata': metadata,
+            'decision': decision,
+            'created_at': created_at,
+        })
+    return results
+
+
+def _semantic_analysis_id(event_id, analyzer, verdict, candidate_content, confidence, rationale, metadata):
+    payload = json.dumps({
+        'event_id': event_id,
+        'analyzer': analyzer,
+        'verdict': verdict,
+        'candidate_content': candidate_content,
+        'confidence': confidence,
+        'rationale': rationale,
+        'metadata': metadata,
+    }, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    return 'ana-' + hashlib.sha256(payload.encode('utf-8')).hexdigest()[:24]
+
+
+def apply_semantic_analysis(conn, event_id, agent_id, *, analyzer, verdict,
+                            candidate_content='', confidence=None, rationale='', metadata=None):
+    """Apply an external semantic verdict while MemCore keeps governance authority.
+
+    The analyzer may only say remember/ignore/defer. A remember verdict can create only
+    a private candidate owned by the event's agent; scope, lifecycle, tombstones,
+    duplicate handling, and durable derivation remain engine-controlled.
+    """
+    analyzer = str(analyzer or '').strip()[:128]
+    verdict = str(verdict or '').strip().lower()
+    candidate_content = _clean_text(candidate_content).strip()[:MAX_ANALYSIS_CANDIDATE_CHARS]
+    rationale = _clean_text(rationale).strip()[:4000]
+    metadata = metadata if isinstance(metadata, dict) else {}
+    if not analyzer:
+        raise core.MemCoreError('semantic analyzer name is required')
+    if verdict not in SEMANTIC_VERDICTS:
+        raise core.MemCoreError('semantic verdict must be remember|ignore|defer')
+    if verdict == 'remember' and not candidate_content:
+        raise core.MemCoreError('remember verdict requires candidate_content')
+    if confidence is not None:
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+            raise core.MemCoreError('semantic confidence must be a number from 0 to 1')
+        confidence = float(confidence)
+        if not 0.0 <= confidence <= 1.0:
+            raise core.MemCoreError('semantic confidence must be a number from 0 to 1')
+
+    analysis_id = _semantic_analysis_id(
+        event_id, analyzer, verdict, candidate_content, confidence, rationale, metadata
+    )
+    conn.execute('BEGIN IMMEDIATE')
+    try:
+        row = conn.execute(
+            'SELECT project_id, agent_id, status, decision FROM ingest_event WHERE id=?',
+            (event_id,)
+        ).fetchone()
+        if row is None:
+            raise core.MemCoreError(f'ingest event not found: {event_id}')
+        project_id, event_agent_id, status, decision = row
+        core._require_membership(conn, project_id, agent_id)
+        if event_agent_id != agent_id:
+            raise core.PermissionDenied('semantic review event belongs to another agent')
+        if status != 'pending':
+            if not str(decision or '').startswith('semantic_'):
+                raise core.MemCoreError(
+                    f'event is already finalized by another path (decision={decision or "none"})'
+                )
+            linked = conn.execute(
+                'SELECT memory_id FROM ingest_derivation WHERE event_id=? '
+                'ORDER BY created_at DESC LIMIT 1', (event_id,)
+            ).fetchone()
+            conn.execute('ROLLBACK')
+            result = {'event_id': event_id, 'status': status, 'decision': decision}
+            if linked:
+                result['memory_id'] = linked[0]
+            return result
+        if decision not in ('semantic_review_required', 'semantic_deferred'):
+            raise core.MemCoreError(
+                f'event is not awaiting semantic review (decision={decision or "none"})'
+            )
+
+        now = core._now()
+        conn.execute(
+            'INSERT OR IGNORE INTO ingest_analysis '
+            '(id,event_id,analyzer,verdict,candidate_content,confidence,rationale,metadata,created_at) '
+            'VALUES (?,?,?,?,?,?,?,?,?)',
+            (analysis_id, event_id, analyzer, verdict, candidate_content, confidence,
+             rationale, json.dumps(metadata, ensure_ascii=False, sort_keys=True), now)
+        )
+        if verdict == 'defer':
+            conn.execute(
+                "UPDATE ingest_event SET decision='semantic_deferred', error=NULL WHERE id=?",
+                (event_id,)
+            )
+            conn.execute('COMMIT')
+            return {'event_id': event_id, 'status': 'pending',
+                    'decision': 'semantic_deferred', 'analysis_id': analysis_id}
+        if verdict == 'ignore':
+            conn.execute(
+                "UPDATE ingest_event SET status='ignored', decision='semantic_ignored', "
+                'error=NULL, processed_at=? WHERE id=?', (now, event_id)
+            )
+            conn.execute('COMMIT')
+            return {'event_id': event_id, 'status': 'ignored',
+                    'decision': 'semantic_ignored', 'analysis_id': analysis_id}
+
+        claim_fp = core.fingerprint(candidate_content)
+        existing = _find_private_claim(conn, project_id, agent_id, claim_fp)
+        if existing:
+            conn.execute(
+                "INSERT OR IGNORE INTO ingest_derivation "
+                "(event_id,memory_id,relation,created_at) VALUES (?,?,'duplicate',?)",
+                (event_id, existing, now)
+            )
+            conn.execute('UPDATE ingest_analysis SET memory_id=? WHERE id=?',
+                         (existing, analysis_id))
+            conn.execute(
+                "UPDATE ingest_event SET status='processed', decision='semantic_duplicate', "
+                'error=NULL, processed_at=? WHERE id=?', (now, event_id)
+            )
+            conn.execute('COMMIT')
+            return {'event_id': event_id, 'status': 'processed',
+                    'decision': 'semantic_duplicate', 'analysis_id': analysis_id,
+                    'memory_id': existing}
+
+        memory_id, _version_id = core.create_memory(
+            conn, project_id, agent_id, candidate_content,
+            scope='private', memory_type='observation', lifecycle='candidate',
+            idempotency_key=f'semantic:{event_id}',
+            reason=f'semantic analysis by {analyzer}', _manage_transaction=False
+        )
+        conn.execute(
+            "INSERT INTO ingest_derivation "
+            "(event_id,memory_id,relation,created_at) VALUES (?,?,'created',?)",
+            (event_id, memory_id, now)
+        )
+        conn.execute('UPDATE ingest_analysis SET memory_id=? WHERE id=?',
+                     (memory_id, analysis_id))
+        conn.execute(
+            "UPDATE ingest_event SET status='processed', decision='semantic_private_candidate', "
+            'error=NULL, processed_at=? WHERE id=?', (now, event_id)
+        )
+        conn.execute('COMMIT')
+        return {'event_id': event_id, 'status': 'processed',
+                'decision': 'semantic_private_candidate', 'analysis_id': analysis_id,
+                'memory_id': memory_id}
+    except Exception:
+        try:
+            conn.execute('ROLLBACK')
+        except Exception:
+            pass
+        raise
+
+
+def semantic_analysis_history(conn, event_id, agent_id):
+    """Return semantic verdict history for one event, enforcing raw-event ownership."""
+    row = conn.execute(
+        'SELECT project_id, agent_id FROM ingest_event WHERE id=?', (event_id,)
+    ).fetchone()
+    if row is None:
+        raise core.MemCoreError(f'ingest event not found: {event_id}')
+    project_id, event_agent_id = row
+    core._require_membership(conn, project_id, agent_id)
+    if event_agent_id != agent_id:
+        raise core.PermissionDenied('semantic review event belongs to another agent')
+    results = []
+    rows = conn.execute(
+        'SELECT id,analyzer,verdict,candidate_content,confidence,rationale,metadata,memory_id,created_at '
+        'FROM ingest_analysis WHERE event_id=? ORDER BY created_at,id', (event_id,)
+    ).fetchall()
+    for row in rows:
+        try:
+            item_metadata = json.loads(row[6] or '{}')
+        except (TypeError, ValueError, json.JSONDecodeError):
+            item_metadata = {}
+        results.append({
+            'analysis_id': row[0], 'analyzer': row[1], 'verdict': row[2],
+            'candidate_content': row[3], 'confidence': row[4], 'rationale': row[5],
+            'metadata': item_metadata, 'memory_id': row[7], 'created_at': row[8],
+        })
+    return results
+
 
 def _find_private_claim(conn, project_id, agent_id, claim_fp):
     rows = conn.execute(
