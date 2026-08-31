@@ -31,7 +31,7 @@ cd C:\Users\BlankScreen\Workspace\memcore
 python -m unittest discover -v
 ```
 
-Current full core gate: 151 tests pass, with the E12 token-budget pair remaining expected failures.
+Current full core gate: 152 tests pass, with the E12 token-budget pair remaining expected failures.
 The E12 token-budget pair remains an expected failure in the core harness
 because prompt-size enforcement lives in the Hermes plugin's recall builder.
 The plugin has its own budget regression tests.

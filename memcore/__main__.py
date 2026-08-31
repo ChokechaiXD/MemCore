@@ -11,6 +11,18 @@ from . import store, core
 DEFAULT_DB = str(pathlib.Path.home() / '.memcore' / 'memory.db')
 
 
+def _configure_stdio_utf8():
+    """Keep CLI output Unicode-safe on Windows legacy console encodings."""
+    for stream_name in ('stdout', 'stderr'):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, 'reconfigure', None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding='utf-8', errors='replace')
+            except (OSError, ValueError):
+                pass
+
+
 def _open(args):
     return store.open_store(getattr(args, 'db', DEFAULT_DB))
 
@@ -777,6 +789,7 @@ def cmd_doctor(args):
 
 
 def main(argv=None):
+    _configure_stdio_utf8()
     parser = argparse.ArgumentParser(
         prog='memcore',
         description='MemCore — shared project memory core + CLI'

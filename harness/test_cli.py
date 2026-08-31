@@ -31,6 +31,23 @@ class CliImportTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_cli_stdio_reconfigures_utf8_when_supported(self):
+        class FakeStream:
+            def __init__(self):
+                self.calls = []
+            def reconfigure(self, **kwargs):
+                self.calls.append(kwargs)
+
+        old_out, old_err = cli.sys.stdout, cli.sys.stderr
+        fake_out, fake_err = FakeStream(), FakeStream()
+        try:
+            cli.sys.stdout, cli.sys.stderr = fake_out, fake_err
+            cli._configure_stdio_utf8()
+        finally:
+            cli.sys.stdout, cli.sys.stderr = old_out, old_err
+        self.assertEqual(fake_out.calls[-1], {'encoding': 'utf-8', 'errors': 'replace'})
+        self.assertEqual(fake_err.calls[-1], {'encoding': 'utf-8', 'errors': 'replace'})
+
     def test_import_dry_run_performs_zero_domain_writes(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
