@@ -6,8 +6,10 @@ idempotency replay, promote permissions, deactivate/restore, search ranking,
 FTS trigger sync, tombstone-guarded creation, migration bookkeeping.
 """
 import os
+import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -66,9 +68,141 @@ class TestStore(CoreTestBase):
         conn2.close()
         self.assertEqual(n, len(store.MIGRATIONS))
 
+    def test_successful_boot_leaves_no_migration_lock(self):
+        self.assertEqual(store.check_migration_lock(self.conn), [])
+        row = self.conn.execute(
+            'SELECT 1 FROM schema_migrations WHERE version=?',
+            (store._MIGRATION_LOCK_VERSION,)
+        ).fetchone()
+        self.assertIsNone(row)
+
+    def test_expired_migration_lock_is_reclaimed_on_open(self):
+        self.conn.execute(
+            'INSERT INTO schema_migrations '
+            '(version, applied_at, lock_holder, lock_until) '
+            "VALUES (?, datetime('now'), 'crashed-worker', 0)",
+            (store._MIGRATION_LOCK_VERSION,)
+        )
+        self.conn.close()
+        conn2 = store.open_store(self.db_path)
+        try:
+            self.assertEqual(store.check_migration_lock(conn2), [])
+        finally:
+            conn2.close()
+
+    def test_doctor_lock_check_reports_stale_lock_rows(self):
+        self.conn.execute(
+            'INSERT INTO schema_migrations '
+            '(version, applied_at, lock_holder, lock_until) '
+            "VALUES (?, datetime('now'), 'crashed-worker', 0)",
+            (store._MIGRATION_LOCK_VERSION,)
+        )
+        locks = store.check_migration_lock(self.conn)
+        self.assertEqual(len(locks), 1)
+        self.assertEqual(locks[0][1], 'crashed-worker')
+
+    def test_migration_renew_fails_if_lease_was_reclaimed(self):
+        holder = store._acquire_migration_lock(self.conn)
+        self.conn.execute(
+            'UPDATE schema_migrations SET lock_holder=?, lock_until=? '
+            'WHERE version=?',
+            ('other-worker', 9999999999.0, store._MIGRATION_LOCK_VERSION)
+        )
+        with self.assertRaises(store.StoreError):
+            store._renew_migration_lock(self.conn, holder)
+        store._release_migration_lock(self.conn, holder)
+        row = self.conn.execute(
+            'SELECT lock_holder FROM schema_migrations WHERE version=?',
+            (store._MIGRATION_LOCK_VERSION,)
+        ).fetchone()
+        self.assertEqual(row[0], 'other-worker')
+        self.conn.execute(
+            'DELETE FROM schema_migrations WHERE version=?',
+            (store._MIGRATION_LOCK_VERSION,)
+        )
+
+    def test_concurrent_fresh_boots_do_not_interleave_migrations(self):
+        fresh = os.path.join(self.tmpdir, 'concurrent.db')
+        barrier = threading.Barrier(3)
+        errors = []
+        versions = []
+
+        def worker():
+            try:
+                barrier.wait()
+                conn = store.open_store(fresh)
+                try:
+                    versions.append(conn.execute(
+                        'SELECT COUNT(*) FROM schema_migrations WHERE version != ?',
+                        (store._MIGRATION_LOCK_VERSION,)
+                    ).fetchone()[0])
+                finally:
+                    conn.close()
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(versions, [len(store.MIGRATIONS)] * 2)
+        check = store.open_store_readonly(fresh)
+        try:
+            self.assertEqual(store.check_migration_lock(check), [])
+        finally:
+            check.close()
+
+    def test_readonly_store_rejects_writes(self):
+        ro = store.open_store_readonly(self.db_path)
+        try:
+            self.assertEqual(ro.execute('PRAGMA query_only').fetchone()[0], 1)
+            with self.assertRaises(sqlite3.OperationalError):
+                ro.execute("INSERT INTO project (id, name) VALUES ('proj-nope', 'nope')")
+        finally:
+            ro.close()
+
+    def test_readonly_store_does_not_create_missing_db(self):
+        missing = os.path.join(self.tmpdir, 'missing.db')
+        with self.assertRaises(store.StoreError):
+            store.open_store_readonly(missing)
+        self.assertFalse(os.path.exists(missing))
+
+    def test_unknown_future_schema_version_fails_closed(self):
+        self.conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) "
+            "VALUES ('9999_future', '2999-01-01 00:00:00')"
+        )
+        self.conn.commit()
+        self.conn.close()
+        with self.assertRaises(store.StoreError):
+            store.open_store(self.db_path)
+
+    def test_failed_open_releases_database_handle(self):
+        self.conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) "
+            "VALUES ('9999_future', '2999-01-01 00:00:00')"
+        )
+        self.conn.close()
+        with self.assertRaises(store.StoreError):
+            store.open_store(self.db_path)
+        moved = self.db_path + '.moved'
+        os.replace(self.db_path, moved)
+        self.assertTrue(os.path.exists(moved))
+        os.replace(moved, self.db_path)
+
     def test_upgrade_from_pre_0004_db(self):
         """A DB created before the schema revision upgrades in place, data intact."""
         self.conn.close()
+        # Start from a genuinely old store. Reusing setUp's already-0006 DB
+        # would correctly fail closed when loaded by a simulated 0003 engine.
+        for suffix in ('', '-wal', '-shm'):
+            try:
+                os.unlink(self.db_path + suffix)
+            except OSError:
+                pass
         real = store.MIGRATIONS
         store.MIGRATIONS = real[:3]  # simulate the old engine (0001–0003 only)
         try:
@@ -109,6 +243,35 @@ class TestStore(CoreTestBase):
         self.assertEqual(len(hits), 1)
         conn.close()
 
+    def test_failed_migration_rolls_back_schema_and_bookkeeping(self):
+        """A failed future migration leaves neither DDL nor migration record."""
+        self.conn.close()
+        real = store.MIGRATIONS
+        bad_name = '9998_test_failure'
+        bad_sql = (
+            'CREATE TABLE migration_should_rollback (id INTEGER);\n'
+            'INSERT INTO definitely_missing_table VALUES (1);\n'
+        )
+        store.MIGRATIONS = real + [(bad_name, bad_sql)]
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                store.open_store(self.db_path)
+        finally:
+            store.MIGRATIONS = real
+        raw = sqlite3.connect(self.db_path)
+        try:
+            table = raw.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='migration_should_rollback'"
+            ).fetchone()
+            recorded = raw.execute(
+                'SELECT 1 FROM schema_migrations WHERE version=?', (bad_name,)
+            ).fetchone()
+            self.assertIsNone(table)
+            self.assertIsNone(recorded)
+        finally:
+            raw.close()
+
 
 class TestCreateMemory(CoreTestBase):
 
@@ -135,6 +298,17 @@ class TestCreateMemory(CoreTestBase):
                 scope='project'
             )
 
+    def test_create_private_memory_requires_membership(self):
+        self.conn.execute(
+            "INSERT INTO agent (id, name, profile_key) VALUES ('agent-mallory', 'mallory', 'mallory')"
+        )
+        self.conn.commit()
+        with self.assertRaises(core.PermissionDenied):
+            core.create_memory(
+                self.conn, self.project, 'agent-mallory', 'private bypass attempt',
+                scope='private'
+            )
+
     def test_idempotency_key_replays_same_ids(self):
         r1 = core.create_memory(
             self.conn, self.project, self.alice, 'shared decision',
@@ -149,6 +323,63 @@ class TestCreateMemory(CoreTestBase):
             "SELECT COUNT(*) FROM audit_event WHERE action='create'"
         ).fetchone()[0]
         self.assertEqual(n, 1, 'replayed create must not write a second audit row')
+
+    def test_idempotency_key_cannot_cross_projects(self):
+        core.create_memory(
+            self.conn, self.project, self.alice, 'project a claim',
+            scope='project', idempotency_key='shared-key'
+        )
+        self.conn.execute("INSERT INTO project (id,name) VALUES ('proj-b','b')")
+        self.conn.execute(
+            "INSERT INTO project_membership (project_id,agent_id,role) "
+            "VALUES ('proj-b',?,'member')", (self.alice,)
+        )
+        with self.assertRaises(core.PermissionDenied):
+            core.create_memory(
+                self.conn, 'proj-b', self.alice, 'project b claim',
+                scope='project', idempotency_key='shared-key'
+            )
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM memory WHERE project_id='proj-b'").fetchone()[0],
+            0
+        )
+
+    def test_idempotency_key_rejects_payload_mismatch(self):
+        core.create_memory(
+            self.conn, self.project, self.alice, 'first payload',
+            scope='project', idempotency_key='payload-key'
+        )
+        with self.assertRaises(core.MemCoreError):
+            core.create_memory(
+                self.conn, self.project, self.alice, 'different payload',
+                scope='project', idempotency_key='payload-key'
+            )
+
+    def test_rejected_idempotent_replay_still_honors_tombstone(self):
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, 'later rejected idempotent claim',
+            scope='project', idempotency_key='reject-key'
+        )
+        core.reject(self.conn, mem_id, self.alice, 'wrong')
+        with self.assertRaises(core.TombstoneBlocked):
+            core.create_memory(
+                self.conn, self.project, self.alice, 'later rejected idempotent claim',
+                scope='project', idempotency_key='reject-key'
+            )
+
+    def test_nonmember_cannot_probe_tombstone_state(self):
+        claim = 'private project rejected fact'
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, claim, scope='project'
+        )
+        core.reject(self.conn, mem_id, self.alice, 'wrong')
+        self.conn.execute(
+            "INSERT INTO agent (id,name,profile_key) VALUES ('agent-mallory','mallory','mallory')"
+        )
+        with self.assertRaises(core.PermissionDenied):
+            core.create_memory(
+                self.conn, self.project, 'agent-mallory', claim, scope='project'
+            )
 
     def test_tombstone_blocks_identical_claim(self):
         claim = 'Alpha uses PostgreSQL for storage.'
@@ -206,6 +437,30 @@ class TestPromote(CoreTestBase):
         self.assertEqual(row[0], 'promote')
         self.assertEqual(row[1], self.alice)
 
+    def test_promotion_blocked_if_claim_was_tombstoned_after_private_create(self):
+        content = 'private claim later proven wrong'
+        private_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, content, scope='private'
+        )
+        duplicate_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, content, scope='project'
+        )
+        core.reject(self.conn, duplicate_id, self.alice, 'wrong')
+        with self.assertRaises(core.TombstoneBlocked):
+            core.promote(self.conn, private_id, self.alice)
+        scope = self.conn.execute(
+            'SELECT scope FROM memory WHERE id=?', (private_id,)
+        ).fetchone()[0]
+        self.assertEqual(scope, 'private')
+
+    def test_rejected_private_memory_cannot_be_promoted(self):
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, 'rejected private candidate', scope='private'
+        )
+        core.reject(self.conn, mem_id, self.alice, 'wrong')
+        with self.assertRaises(core.MemCoreError):
+            core.promote(self.conn, mem_id, self.alice)
+
 
 class TestSupersedeAndDeactivate(CoreTestBase):
 
@@ -220,9 +475,17 @@ class TestSupersedeAndDeactivate(CoreTestBase):
             'SELECT current_version_id FROM memory WHERE id=?', (mem_id,)
         ).fetchone()[0]
         self.assertEqual(cur, v2)
-        versions = core.superseded_history(self.conn, mem_id)
+        versions = core.superseded_history(self.conn, mem_id, self.alice)
         self.assertEqual(len(versions), 2)
         self.assertEqual(versions[0][0], v1)
+
+    def test_private_history_does_not_leak_to_other_member(self):
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, 'alice private history', scope='private'
+        )
+        core.supersede(self.conn, mem_id, self.alice, 'alice private history updated')
+        self.assertEqual(core.superseded_history(self.conn, mem_id, self.bob), [])
+        self.assertEqual(len(core.superseded_history(self.conn, mem_id, self.alice)), 2)
 
     def test_supersede_audited(self):
         mem_id, _ = core.create_memory(
@@ -235,6 +498,88 @@ class TestSupersedeAndDeactivate(CoreTestBase):
             (mem_id,)
         ).fetchone()[0]
         self.assertEqual(action, 'supersede')
+
+    def test_supersede_memory_rejects_silent_cross_project_move(self):
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, 'stay in project', scope='project'
+        )
+        with self.assertRaises(core.MemCoreError):
+            core.supersede_memory(
+                self.conn, mem_id, self.alice, 'should not move',
+                new_project_id='proj-other'
+            )
+        project_id = self.conn.execute(
+            'SELECT project_id FROM memory WHERE id=?', (mem_id,)
+        ).fetchone()[0]
+        self.assertEqual(project_id, self.project)
+
+    def test_member_cannot_modify_anothers_private_memory(self):
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, 'alice private mutable note', scope='private'
+        )
+        with self.assertRaises(core.PermissionDenied):
+            core.supersede(self.conn, mem_id, self.bob, 'bob rewrite')
+        with self.assertRaises(core.PermissionDenied):
+            core.reject(self.conn, mem_id, self.bob, 'bob reject')
+        with self.assertRaises(core.PermissionDenied):
+            core.deactivate(self.conn, mem_id, self.bob)
+
+    def test_rejected_memory_cannot_be_deactivated_and_resurrected(self):
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, 'bad terminal claim', scope='project'
+        )
+        core.reject(self.conn, mem_id, self.alice, 'wrong')
+        with self.assertRaises(core.MemCoreError):
+            core.deactivate(self.conn, mem_id, self.alice)
+        lifecycle = self.conn.execute(
+            'SELECT lifecycle FROM memory WHERE id=?', (mem_id,)
+        ).fetchone()[0]
+        self.assertEqual(lifecycle, 'rejected')
+
+    def test_reject_is_idempotent_and_does_not_duplicate_tombstones(self):
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, 'reject only once', scope='project'
+        )
+        self.assertTrue(core.reject(self.conn, mem_id, self.alice, 'wrong'))
+        self.assertFalse(core.reject(self.conn, mem_id, self.alice, 'wrong again'))
+        fp = core.fingerprint('reject only once')
+        n = self.conn.execute(
+            'SELECT COUNT(*) FROM tombstone WHERE claim_fingerprint=? AND scope=? '
+            'AND overridden_by IS NULL',
+            (fp, self.project)
+        ).fetchone()[0]
+        self.assertEqual(n, 1)
+
+    def test_two_duplicate_memories_share_one_active_tombstone(self):
+        content = 'duplicate claim existed before rejection'
+        first, _ = core.create_memory(
+            self.conn, self.project, self.alice, content, scope='project'
+        )
+        second, _ = core.create_memory(
+            self.conn, self.project, self.alice, content, scope='project'
+        )
+        core.reject(self.conn, first, self.alice, 'wrong')
+        core.reject(self.conn, second, self.alice, 'also wrong')
+        fp = core.fingerprint(content)
+        n = self.conn.execute(
+            'SELECT COUNT(*) FROM tombstone WHERE claim_fingerprint=? AND scope=? '
+            'AND overridden_by IS NULL',
+            (fp, self.project)
+        ).fetchone()[0]
+        self.assertEqual(n, 1)
+
+    def test_restore_is_blocked_by_active_tombstone(self):
+        content = 'claim disabled before later rejection'
+        original, _ = core.create_memory(
+            self.conn, self.project, self.alice, content, scope='project'
+        )
+        core.deactivate(self.conn, original, self.alice)
+        duplicate, _ = core.create_memory(
+            self.conn, self.project, self.alice, content, scope='project'
+        )
+        core.reject(self.conn, duplicate, self.alice, 'later found wrong')
+        with self.assertRaises(core.TombstoneBlocked):
+            core.restore(self.conn, original, self.alice)
 
     def test_deactivate_restore_roundtrip(self):
         mem_id, _ = core.create_memory(
@@ -274,6 +619,35 @@ class TestSearch(CoreTestBase):
         self.assertEqual(len(contents), 1)
         self.assertIn('GitHub Actions', contents[0])
 
+    def test_visible_memories_include_rejected_flag_is_honored(self):
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice,
+            'rejected but inspectable claim', scope='project'
+        )
+        core.reject(self.conn, mem_id, self.alice, 'wrong')
+        hidden = core.visible_memories(self.conn, self.project, self.alice)
+        shown = core.visible_memories(
+            self.conn, self.project, self.alice, include_rejected=True
+        )
+        self.assertNotIn(mem_id, [r[0] for r in hidden])
+        self.assertIn(mem_id, [r[0] for r in shown])
+
+    def test_nonmember_cannot_read_project_memory(self):
+        core.create_memory(
+            self.conn, self.project, self.alice,
+            'shared deployment secretless fact', scope='project'
+        )
+        self.conn.execute(
+            "INSERT INTO agent (id, name, profile_key) VALUES ('agent-mallory', 'mallory', 'mallory')"
+        )
+        self.conn.commit()
+        self.assertEqual(
+            core.search(self.conn, self.project, 'agent-mallory', 'deployment'), []
+        )
+        self.assertEqual(
+            core.visible_memories(self.conn, self.project, 'agent-mallory'), []
+        )
+
     def test_fts_trigger_keeps_index_in_sync(self):
         core.create_memory(
             self.conn, self.project, self.alice, 'unique xyzzy content', scope='project'
@@ -289,6 +663,15 @@ class TestSearch(CoreTestBase):
         core.supersede(self.conn, mem_id, self.alice, 'rewritten content about quux2')
         hits = core.search(self.conn, self.project, self.alice, 'quux2')
         self.assertEqual(len(hits), 1, 'FTS did not pick up updated content')
+
+    def test_search_supports_unicode_thai_query(self):
+        core.create_memory(
+            self.conn, self.project, self.alice,
+            'ระบบความจำร่วมสำหรับเอเจนต์', scope='project'
+        )
+        hits = core.search(self.conn, self.project, self.bob, 'ระบบความจำร่วม')
+        self.assertEqual(len(hits), 1)
+        self.assertIn('ระบบความจำร่วม', hits[0][5])
 
     def test_search_survives_fts_operators_in_query(self):
         """Regression: raw user strings with FTS5 operator chars must not raise.
@@ -379,16 +762,17 @@ class TestGC(CoreTestBase):
         self.assertEqual(len(candidates), 0)
         self.assertEqual(len(tombstones), 0)
 
-    def test_gc_scan_finds_old_tombstones(self):
-        """tombstones older than cutoff are gc candidates for purging."""
+    def test_gc_scan_finds_old_overridden_tombstones(self):
+        """Only old overridden tombstones are gc candidates for purging."""
         mem_id, ver_id = core.create_memory(
             self.conn, self.project, self.alice, 'rejected claim for tombstone', scope='project'
         )
         core.reject(self.conn, mem_id, self.alice, 'outdated')
         tomb_id = self.conn.execute('SELECT id FROM tombstone').fetchone()[0]
         self.conn.execute(
-            "UPDATE tombstone SET created_at=datetime('now', '-100 days') WHERE id=?",
-            (tomb_id,)
+            "UPDATE tombstone SET overridden_by=?, "
+            "created_at=datetime('now', '-100 days') WHERE id=?",
+            (self.alice, tomb_id)
         )
         self.conn.commit()
         candidates, tombstones = core.gc_scan(self.conn, candidate_days=30, tombstone_days=90)
@@ -434,16 +818,17 @@ class TestGC(CoreTestBase):
         ).fetchone()[0]
         self.assertEqual(reason, 'gc')
 
-    def test_gc_apply_purges_old_tombstones(self):
-        """gc_apply removes tombstones past the tombstone-days cutoff."""
+    def test_gc_apply_purges_old_overridden_tombstones(self):
+        """gc_apply removes only overridden tombstones past the cutoff."""
         mem_id, ver_id = core.create_memory(
             self.conn, self.project, self.alice, 'gone soon', scope='project'
         )
         core.reject(self.conn, mem_id, self.alice, 'obsolete')
         tomb_id = self.conn.execute('SELECT id FROM tombstone').fetchone()[0]
         self.conn.execute(
-            "UPDATE tombstone SET created_at=datetime('now', '-100 days') WHERE id=?",
-            (tomb_id,)
+            "UPDATE tombstone SET overridden_by=?, "
+            "created_at=datetime('now', '-100 days') WHERE id=?",
+            (self.alice, tomb_id)
         )
         self.conn.commit()
         tombstoned, purged = core.gc_apply(self.conn, candidate_days=30, tombstone_days=90)
@@ -454,6 +839,37 @@ class TestGC(CoreTestBase):
             'SELECT COUNT(*) FROM tombstone WHERE id=?', (tomb_id,)
         ).fetchone()[0]
         self.assertEqual(count, 0)
+
+    def test_gc_never_purges_active_tombstone_by_age(self):
+        content = 'known bad claim must stay blocked'
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, content, scope='project'
+        )
+        core.reject(self.conn, mem_id, self.alice, 'wrong')
+        tomb_id = self.conn.execute('SELECT id FROM tombstone').fetchone()[0]
+        self.conn.execute(
+            "UPDATE tombstone SET created_at=datetime('now', '-1000 days') WHERE id=?",
+            (tomb_id,)
+        )
+        self.conn.commit()
+        candidates, tombstones = core.gc_scan(
+            self.conn, candidate_days=30, tombstone_days=90
+        )
+        self.assertEqual(tombstones, [])
+        _, purged = core.gc_apply(
+            self.conn, candidate_days=30, tombstone_days=90
+        )
+        self.assertEqual(purged, [])
+        self.assertEqual(
+            self.conn.execute(
+                'SELECT COUNT(*) FROM tombstone WHERE id=?', (tomb_id,)
+            ).fetchone()[0],
+            1
+        )
+        with self.assertRaises(core.TombstoneBlocked):
+            core.create_memory(
+                self.conn, self.project, self.alice, content, scope='project'
+            )
 
     def test_gc_apply_does_not_touch_recent_memories(self):
         """gc_apply must not affect young candidates or recent tombstones."""
@@ -467,6 +883,46 @@ class TestGC(CoreTestBase):
             'SELECT lifecycle FROM memory WHERE id=?', (mem_id,)
         ).fetchone()[0]
         self.assertEqual(lc, 'candidate')
+
+    def test_gc_scan_parses_iso_z_timestamps(self):
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, 'iso timestamp gc candidate', scope='project'
+        )
+        self.conn.execute(
+            "UPDATE memory SET created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-40 days') "
+            'WHERE id=?', (mem_id,)
+        )
+        candidates, _ = core.gc_scan(self.conn, candidate_days=30)
+        self.assertIn(mem_id, [row[0] for row in candidates])
+
+    def test_gc_apply_rechecks_evidence_after_stale_scan(self):
+        mem_id, ver_id = core.create_memory(
+            self.conn, self.project, self.alice, 'race protected candidate', scope='project'
+        )
+        self.conn.execute(
+            "UPDATE memory SET created_at=datetime('now','-40 days') WHERE id=?", (mem_id,)
+        )
+        stale = core.gc_scan(self.conn, candidate_days=30, tombstone_days=90)
+        ev_id = core._new_id('ev')
+        self.conn.execute(
+            'INSERT INTO evidence (id,kind,source_uri,source_label) VALUES (?,?,?,?)',
+            (ev_id, 'test', 'test://late', 'late evidence')
+        )
+        self.conn.execute(
+            "INSERT INTO evidence_link (evidence_id,memory_version_id,relation) VALUES (?,?,'supports')",
+            (ev_id, ver_id)
+        )
+        original = core.gc_scan
+        core.gc_scan = lambda *_a, **_k: stale
+        try:
+            tombstoned, _ = core.gc_apply(self.conn, candidate_days=30, tombstone_days=90)
+        finally:
+            core.gc_scan = original
+        self.assertNotIn(mem_id, tombstoned)
+        lifecycle = self.conn.execute(
+            'SELECT lifecycle FROM memory WHERE id=?', (mem_id,)
+        ).fetchone()[0]
+        self.assertEqual(lifecycle, 'candidate')
 
 
 class TestStats(CoreTestBase):
@@ -564,6 +1020,38 @@ class TestImport(CoreTestBase):
         ).fetchone()[0]
         self.assertEqual(ev, 'file')
 
+    def test_import_rolls_back_memory_if_evidence_insert_fails(self):
+        self.conn.execute(
+            "INSERT INTO evidence (id, kind, source_uri) VALUES ('ev-collision', 'file', 'existing')"
+        )
+        self.conn.commit()
+        item = [{'summary': 'atomic import claim', 'type': 'fact',
+                 'evidence': [{'kind': 'file', 'source_uri': 'new'}]}]
+        original_new_id = core._new_id
+        core._new_id = lambda prefix: 'ev-collision' if prefix == 'ev' else original_new_id(prefix)
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):
+                core.import_memories(
+                    self.conn, item, self.project, self.alice, scope='project'
+                )
+        finally:
+            core._new_id = original_new_id
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM memory_version WHERE content='atomic import claim'"
+            ).fetchone()[0], 0
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM audit_event WHERE detail LIKE '%atomic import claim%'"
+            ).fetchone()[0], 0
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM idempotency_key WHERE key LIKE 'import:%'"
+            ).fetchone()[0], 0
+        )
+
     def test_import_dedup_by_fingerprint(self):
         """sha256 fingerprint dedup: same summary text -> one memory."""
         single = [{'summary': 'shared claim', 'type': 'fact'}]
@@ -572,6 +1060,79 @@ class TestImport(CoreTestBase):
         )
         self.assertEqual(result['added'], 1)
         self.assertEqual(result['skipped'], 0)
+
+    def test_plan_import_is_read_only_and_classifies_batch(self):
+        before = self.conn.execute('SELECT COUNT(*) FROM memory').fetchone()[0]
+        plan = core.plan_import(self.conn, self.items, self.project)
+        after = self.conn.execute('SELECT COUNT(*) FROM memory').fetchone()[0]
+        self.assertEqual(before, after)
+        self.assertEqual(plan['total'], 4)
+        self.assertEqual(plan['would_add'], 2)
+        self.assertEqual(plan['skipped'], 2)
+        self.assertEqual(plan['reasons']['duplicate_input'], 1)
+        self.assertEqual(plan['reasons']['empty_summary'], 1)
+
+    def test_plan_import_detects_existing_import_without_writes(self):
+        single = [{'summary': 'already imported claim', 'type': 'fact'}]
+        core.import_memories(
+            self.conn, single, self.project, self.alice, scope='project'
+        )
+        before = self.conn.total_changes
+        plan = core.plan_import(self.conn, single, self.project)
+        self.assertEqual(conn_changes := self.conn.total_changes, before)
+        self.assertEqual(plan['would_add'], 0)
+        self.assertEqual(plan['reasons']['already_imported'], 1)
+        self.assertEqual(conn_changes, before)
+
+    def test_import_skips_claim_already_present_from_other_write_path(self):
+        content = 'manual memory already covers migration claim'
+        core.create_memory(
+            self.conn, self.project, self.alice, content, scope='project'
+        )
+        items = [{'summary': content, 'type': 'fact'}]
+        plan = core.plan_import(self.conn, items, self.project)
+        self.assertEqual(plan['would_add'], 0)
+        self.assertEqual(plan['reasons']['already_present'], 1)
+        result = core.import_memories(
+            self.conn, items, self.project, self.alice, scope='project'
+        )
+        self.assertEqual(result['added'], 0)
+        self.assertEqual(result['skipped'], 1)
+
+    def test_private_claim_does_not_block_project_import(self):
+        content = 'same words but different visibility contract'
+        core.create_memory(
+            self.conn, self.project, self.alice, content, scope='private'
+        )
+        items = [{'summary': content, 'type': 'fact'}]
+        plan = core.plan_import(
+            self.conn, items, self.project, scope='project', agent_id=self.alice
+        )
+        self.assertEqual(plan['would_add'], 1)
+        result = core.import_memories(
+            self.conn, items, self.project, self.alice, scope='project'
+        )
+        self.assertEqual(result['added'], 1)
+        scopes = self.conn.execute(
+            'SELECT scope FROM memory m JOIN memory_version v '
+            'ON v.id=m.current_version_id WHERE v.content=? ORDER BY scope',
+            (content,)
+        ).fetchall()
+        self.assertEqual([row[0] for row in scopes], ['private', 'project'])
+
+    def test_invalid_evidence_fields_match_dry_run_and_real_import(self):
+        bad = [{
+            'summary': 'malformed evidence binding',
+            'evidence': [{'kind': 'file', 'source_uri': {'not': 'bindable'}}],
+        }]
+        plan = core.plan_import(self.conn, bad, self.project)
+        self.assertEqual(plan['would_add'], 0)
+        self.assertEqual(plan['reasons']['invalid_evidence'], 1)
+        result = core.import_memories(
+            self.conn, bad, self.project, self.alice, scope='project'
+        )
+        self.assertEqual(result['added'], 0)
+        self.assertEqual(result['skipped'], 1)
 
 
 if __name__ == '__main__':

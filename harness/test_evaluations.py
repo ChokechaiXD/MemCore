@@ -68,9 +68,9 @@ def _admission_check(conn, claim_text, project_id):
     return core.admission_allowed(conn, claim_text, project_id)
 
 
-def _resolve_conflict_memories(conn, project_id):
-    """Memories in conflict state — core.conflict_memories."""
-    return core.conflict_memories(conn, project_id)
+def _resolve_conflict_memories(conn, project_id, agent_id):
+    """Readable conflict memories — core enforces membership/private scope."""
+    return core.conflict_memories(conn, project_id, agent_id)
 
 
 def _simulate_supersede(conn, old_memory_id, new_content, agent_id, reason):
@@ -294,11 +294,14 @@ class TestE8_ConflictAbstention(EvalTestBase):
 
     def test_conflict_memories_visible_to_both_parties(self):
         """Both conflicting claims must be exposed, not hidden."""
-        rows = _resolve_conflict_memories(self.conn, fixtures.PROJECT_NC)
-        self.assertGreaterEqual(
-            len(rows), 2,
-            f'Expected 2 conflicting memories exposed, got {len(rows)}'
-        )
+        for agent_id in (fixtures.AGENT_SORA, fixtures.AGENT_MIKA):
+            rows = _resolve_conflict_memories(
+                self.conn, fixtures.PROJECT_NC, agent_id
+            )
+            self.assertGreaterEqual(
+                len(rows), 2,
+                f'Expected 2 conflicts for {agent_id}, got {len(rows)}'
+            )
 
     def test_conflict_not_resolved_silently(self):
         """Neither claim should have been auto-promoted to 'accepted'."""

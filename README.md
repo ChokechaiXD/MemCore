@@ -1,60 +1,61 @@
-# MemCore — Phase 0 Evaluation Harness
+# MemCore
 
-Phase 0: fixtures + automated negative-test suite validating the 12 integration
-evaluations from the research audit. The core engine does not exist yet.
+Local-first shared project memory for Hermes profiles. MemCore uses one SQLite
+store with WAL + FTS5, immutable memory versions, tombstones, audit events,
+project membership, and explicit private/project lanes. It is daemonless and
+uses the Python standard library for the core engine.
 
-## What's here
+## Current status
 
-```
+- Phase 1 core correctness: implemented and covered by the integration harness.
+- Phase 2 Hermes plugin: installed separately under the user plugin directory.
+- Phase 3+ lifecycle/source-aware features: incremental; see the planning repo.
+- Schema contract remains frozen; revisions are applied through migrations.
+
+## Repository layout
+
+```text
 memcore/
-├── schema/schema.sql        ← minimal SQLite schema (Phase 1 contract)
-├── fixtures/fixtures.py     ← 2 agents, 2 projects, evidence, tombstone, conflicts
-├── harness/
-│   └── test_evaluations.py  ← 21 tests: 12 evaluations + schema/concurrency checks (2 xfail)
-│   └── __main__.py          ← python -m harness entrypoint
-└── README.md
+├── memcore/core.py          # memory operations, search, GC, import, stats
+├── memcore/store.py         # SQLite/WAL setup + migrations
+├── memcore/__main__.py      # CLI + doctor
+├── schema/schema.sql        # frozen initial contract
+├── fixtures/fixtures.py     # deterministic evaluation fixtures
+├── harness/                 # unit + integration evaluation suite
+└── scripts/                 # scratch setup + search benchmark
 ```
 
-## How to run
-
-```bash
-cd C:/Users/BlankScreen/Workspace/memcore
+## Run the test suite
+```powershell
+cd C:\Users\BlankScreen\Workspace\memcore
 python -m unittest discover -v
 ```
 
-Expected output: pass/xfail/skip summary. Two xfail tests (the E12 token-budget pair)
-await the real core; E1–E8 pass against the query-stub spec (fail loudly if the spec
-drifts); E9/E10/E11 run for real against SQLite WAL.
+The E12 token-budget pair remains an expected failure in the core harness
+because prompt-size enforcement lives in the Hermes plugin's recall builder.
+The plugin has its own budget regression tests.
 
-## What the 12 evaluations test
+## Operational CLI
 
-| # | Name | Status | What it proves when passing |
-|---|------|--------|-----------------------------|
-| E1 | Shared decision recall | pass (spec) | A writes, B in same project recalls it |
-| E2 | Private isolation | pass (spec) | B never retrieves A's private memory |
-| E3 | Project isolation | pass (spec) | Project B can't see Project A memory |
-| E4 | Irrelevant recall | pass (spec) | Unrelated project memory not injected |
-| E5 | Correction/supersede | pass (spec) | New version supersedes old; history survives |
-| E6 | Staleness on source change | pass (spec) | Code-backed memory goes stale on commit change |
-| E7 | Tombstone resurrection | pass (spec) | Rejected claim can't silently re-add |
-| E8 | Conflict abstention | pass (spec) | Conflicting claims expose, not auto-resolve |
-| E9 | Concurrency | PASS | Two writers → no corrupt/duplicate rows |
-| E10 | Crash recovery | PASS | Kill mid-write → DB usable, audit coherent |
-| E11 | Daemonless | PASS | No persistent process after all clients close |
-| E12 | Token budget | xfail | Recall block stays under defined ceiling |
+```powershell
+python -m memcore doctor
+python -m memcore stats
+python -m memcore gc
+python -m memcore gc --apply
+python -m memcore import --file batch.json --agent mika --project shared-platform --dry-run
+python -m memcore import --file batch.json --agent mika --project shared-platform
+```
 
-## How to flip tests as the core lands
+`gc` is dry-run by default. `import --dry-run` validates the batch, reports
+within-batch duplicates / prior imports / tombstone blocks, and performs zero
+domain writes (no agent, membership, memory, or audit rows). Imported memories
+enter as candidates. Real import is idempotent per project + content fingerprint,
+and each memory plus all evidence links commits atomically as one item.
 
-Phase 1 (DONE): the query stubs are now thin adapters over `memcore.core`
-(`visible_memories`, `private_memories`, `admission_allowed`, `conflict_memories`,
-`supersede`). Assertions are unchanged. E12 stays `@expectedFailure` until the
-Phase 2 `pre_llm_call` budget enforcement lands; cross-project discovery
-(`_query_cross_project`) is still raw SQL pending Phase 7's reusable flag.
+## Safety invariants
 
-## Design notes
-
-- Python 3.11, stdlib only (unittest + sqlite3). No pytest, no pip deps.
-- All tests use isolated in-memory DBs except concurrency/crash tests which use
-  real temp files with WAL mode.
-- Query stubs in `test_evaluations.py` are the SPEC, not the engine — they encode
-  what the core must do. Phase 1 replaces them with real core queries.
+- Project membership is required at read and write boundaries.
+- Private memory is writable only by its owner or a project owner.
+- Plugin-bound mutations cannot target another project by memory ID.
+- Rejected claims create tombstones that block silent resurrection.
+- Search returns only the current memory version; history remains queryable.

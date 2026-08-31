@@ -4,11 +4,15 @@ MemCore — storage layer.
 open_store(): apply schema, run pending migrations under a lock, set pragmas.
 All operations use short transactions and WAL + busy_timeout.
 """
+import os
 import sqlite3
 import pathlib
 import time
 
 SCHEMA_PATH = pathlib.Path(__file__).resolve().parent.parent / 'schema' / 'schema.sql'
+_MIGRATION_LOCK_VERSION = '__migration_lock__'
+_MIGRATION_LOCK_TTL_SECONDS = 30.0
+_MIGRATION_LOCK_WAIT_SECONDS = 10.0
 
 # Migrations run in order; each is a list of SQL statements.
 # 0001 = initial contract (schema.sql). Later migrations append here.
@@ -191,30 +195,74 @@ def _current_version(conn):
     if not _table_exists(conn, 'schema_migrations'):
         return None
     cur = conn.execute(
-        'SELECT version FROM schema_migrations ORDER BY applied_at DESC, rowid DESC LIMIT 1'
+        'SELECT version FROM schema_migrations WHERE version != ? '
+        'ORDER BY applied_at DESC, rowid DESC LIMIT 1',
+        (_MIGRATION_LOCK_VERSION,)
     )
     row = cur.fetchone()
     return row[0] if row else None
 
 
-def open_store(db_path: str) -> sqlite3.Connection:
+def open_store(db_path: str, check_same_thread: bool = True) -> sqlite3.Connection:
     """
     Open (creating if needed) a MemCore store.
 
     Returns a sqlite3.Connection with pragmas set and all migrations applied,
     under a migration lock so two processes booting concurrently are safe.
     """
-    p = pathlib.Path(db_path)
+    p = pathlib.Path(db_path).expanduser()
     p.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(p), timeout=10, isolation_level=None)
-    # Pragmas are per-connection: set on every open.
-    conn.execute('PRAGMA journal_mode = WAL')
-    conn.execute('PRAGMA busy_timeout = 5000')
-    conn.execute('PRAGMA foreign_keys = ON')
-    conn.execute('PRAGMA synchronous = NORMAL')
-    conn.execute('PRAGMA synchronous = NORMAL')
-    apply_migrations(conn)
-    return conn
+    conn = sqlite3.connect(
+        str(p), timeout=10, isolation_level=None,
+        check_same_thread=check_same_thread
+    )
+    try:
+        # Set the busy timeout before WAL negotiation: concurrent first boots
+        # can otherwise race on PRAGMA journal_mode before SQLite has a chance
+        # to wait for the other connection's schema lock.
+        conn.execute('PRAGMA busy_timeout = 10000')
+        deadline = time.time() + 10.0
+        while True:
+            try:
+                conn.execute('PRAGMA journal_mode = WAL')
+                break
+            except sqlite3.OperationalError as e:
+                if 'locked' not in str(e).lower() and 'busy' not in str(e).lower():
+                    raise
+                if time.time() >= deadline:
+                    raise
+                time.sleep(0.05)
+        conn.execute('PRAGMA foreign_keys = ON')
+        conn.execute('PRAGMA synchronous = NORMAL')
+        apply_migrations(conn)
+        return conn
+    except Exception:
+        conn.close()
+        raise
+
+
+def open_store_readonly(db_path: str) -> sqlite3.Connection:
+    """Open an existing, current MemCore store without schema/domain writes."""
+    p = pathlib.Path(db_path).expanduser().resolve()
+    if not p.is_file():
+        raise StoreError(f'store does not exist: {p}')
+    conn = sqlite3.connect(p.as_uri() + '?mode=ro', uri=True, timeout=10,
+                           isolation_level=None)
+    try:
+        conn.execute('PRAGMA busy_timeout = 5000')
+        conn.execute('PRAGMA foreign_keys = ON')
+        conn.execute('PRAGMA query_only = ON')
+        current = _current_version(conn)
+        expected = MIGRATIONS[-1][0]
+        if current != expected:
+            raise StoreError(
+                f'read-only store schema is {current or "unversioned"}; '
+                f'expected {expected}. Open normally to migrate first.'
+            )
+        return conn
+    except Exception:
+        conn.close()
+        raise
 
 
 def apply_migrations(conn):
@@ -233,87 +281,238 @@ def apply_migrations(conn):
     _run_migrations(conn)
 
 
-def _run_migrations(conn):
-    """Apply pending migrations under a transient lock row.
+def _migration_lock_row(conn):
+    return conn.execute(
+        'SELECT lock_holder, lock_until FROM schema_migrations WHERE version=?',
+        (_MIGRATION_LOCK_VERSION,)
+    ).fetchone()
 
-    SQLite serializes writers anyway; the lock row exists so a crashed
-    migration boot can be diagnosed and so 'doctor' can report it.
-    """
-    version = _current_version(conn)
-    if version is None:
-        # Fresh DB (or pre-bookkeeping legacy): apply full contract first,
-        # then continue with any statement migrations that follow it.
-        _apply_migration(conn, '0001_initial_contract', SCHEMA_PATH.read_text(encoding='utf-8'))
-        pending = MIGRATIONS[1:]
-    else:
-        known = [v for v, _ in MIGRATIONS]
+
+def _acquire_migration_lock(conn):
+    """Acquire a crash-visible migration lock row, reclaiming only expired locks."""
+    holder = f'pid:{os.getpid()}:conn:{id(conn)}'
+    deadline = time.time() + _MIGRATION_LOCK_WAIT_SECONDS
+    while True:
+        now = time.time()
         try:
-            idx = known.index(version)
-        except ValueError:
-            # DB is at a version this code doesn't know — never downgrade silently.
+            conn.execute('BEGIN IMMEDIATE')
+            row = _migration_lock_row(conn)
+            if row and row[0] and row[1] is not None and row[1] > now and row[0] != holder:
+                conn.execute('ROLLBACK')
+                if time.time() >= deadline:
+                    raise StoreError(
+                        f'migration lock held by {row[0]} until {row[1]:.3f}'
+                    )
+                time.sleep(0.05)
+                continue
+            conn.execute(
+                'INSERT INTO schema_migrations '
+                '(version, applied_at, lock_holder, lock_until) '
+                "VALUES (?, datetime('now'), ?, ?) "
+                'ON CONFLICT(version) DO UPDATE SET '
+                "applied_at=datetime('now'), lock_holder=excluded.lock_holder, "
+                'lock_until=excluded.lock_until',
+                (_MIGRATION_LOCK_VERSION, holder,
+                 now + _MIGRATION_LOCK_TTL_SECONDS)
+            )
+            conn.execute('COMMIT')
+            return holder
+        except StoreError:
+            raise
+        except sqlite3.OperationalError as e:
+            try:
+                conn.execute('ROLLBACK')
+            except sqlite3.OperationalError:
+                pass
+            if time.time() >= deadline:
+                raise StoreError(f'could not acquire migration lock: {e}') from e
+            time.sleep(0.05)
+
+
+def _release_migration_lock(conn, holder):
+    deadline = time.time() + _MIGRATION_LOCK_WAIT_SECONDS
+    while True:
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            conn.execute(
+                'DELETE FROM schema_migrations WHERE version=? AND lock_holder=?',
+                (_MIGRATION_LOCK_VERSION, holder)
+            )
+            conn.execute('COMMIT')
             return
-        pending = MIGRATIONS[idx + 1:]
-    for name, sql in pending:
-        _apply_migration(conn, name, sql)
+        except sqlite3.OperationalError as e:
+            try:
+                conn.execute('ROLLBACK')
+            except sqlite3.OperationalError:
+                pass
+            if time.time() >= deadline:
+                raise StoreError(f'could not release migration lock: {e}') from e
+            time.sleep(0.05)
+
+
+def _renew_migration_lock(conn, holder):
+    """Renew only while this process still owns the migration lease."""
+    conn.execute('BEGIN IMMEDIATE')
+    try:
+        cur = conn.execute(
+            'UPDATE schema_migrations SET lock_until=? '
+            'WHERE version=? AND lock_holder=?',
+            (time.time() + _MIGRATION_LOCK_TTL_SECONDS,
+             _MIGRATION_LOCK_VERSION, holder)
+        )
+        if cur.rowcount != 1:
+            raise StoreError('migration lock ownership was lost')
+        conn.execute('COMMIT')
+    except Exception:
+        try:
+            conn.execute('ROLLBACK')
+        except sqlite3.OperationalError:
+            pass
+        raise
+
+
+def _run_migrations(conn):
+    """Apply pending migrations under one crash-visible process lock."""
+    known = [v for v, _ in MIGRATIONS]
+    version = _current_version(conn)
+    if version is not None and version not in known:
+        raise StoreError(f'unsupported schema migration version: {version}')
+
+    has_pending = version is None or version != known[-1]
+    if not has_pending and _migration_lock_row(conn) is None:
+        return
+
+    holder = _acquire_migration_lock(conn)
+    try:
+        # Re-read after acquiring: another process may have completed while
+        # this connection was waiting for the lock.
+        version = _current_version(conn)
+        if version is None:
+            _apply_migration(
+                conn, '0001_initial_contract',
+                SCHEMA_PATH.read_text(encoding='utf-8')
+            )
+            pending = MIGRATIONS[1:]
+        else:
+            if version not in known:
+                raise StoreError(f'unsupported schema migration version: {version}')
+            pending = MIGRATIONS[known.index(version) + 1:]
+        for name, sql in pending:
+            # Renew transactionally and verify ownership before every step.
+            # If another process reclaimed an expired lease after a long
+            # migration, this process must stop instead of interleaving.
+            _renew_migration_lock(conn, holder)
+            _apply_migration(conn, name, sql)
+    finally:
+        _release_migration_lock(conn, holder)
+
+
+def _script_statements(sql):
+    """Yield complete SQLite statements, preserving trigger BEGIN/END blocks."""
+    buf = ''
+    for line in sql.splitlines(keepends=True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            stmt = buf.strip()
+            if stmt:
+                yield stmt
+            buf = ''
+    if buf.strip():
+        raise StoreError('incomplete SQL statement in migration')
 
 
 def _apply_migration(conn, name, sql):
-    """Apply one migration, recording it in schema_migrations.
+    """Apply one migration and its bookkeeping safely.
 
-    schema.sql migrations use executescript(), which issues an implicit
-    COMMIT first (python sqlite3 semantics) — so they CANNOT be wrapped in
-    an explicit transaction. Statement migrations run transactionally.
-    Both paths are idempotent via the schema_migrations re-check.
+    The frozen schema bootstrap still uses executescript because it contains
+    connection PRAGMAs. Later migrations are executed statement-by-statement
+    inside one explicit transaction, with the migration row committed in the
+    same transaction. Table-rebuild migration 0004 temporarily disables FK
+    enforcement and runs foreign_key_check before commit, per SQLite guidance.
     """
-    # Re-check without an open transaction first (another process may have raced us)
     already = conn.execute(
         'SELECT 1 FROM schema_migrations WHERE version = ?', (name,)
     ).fetchone()
     if already:
         return
+
     if sql is None:
-        # Contract migration: full schema file via executescript (self-committing).
         conn.executescript(SCHEMA_PATH.read_text(encoding='utf-8'))
-    else:
-        conn.execute('BEGIN IMMEDIATE')
+        for attempt in range(5):
+            try:
+                conn.execute('BEGIN IMMEDIATE')
+                if conn.execute(
+                    'SELECT 1 FROM schema_migrations WHERE version=?', (name,)
+                ).fetchone():
+                    conn.execute('ROLLBACK')
+                    return
+                conn.execute(
+                    'INSERT INTO schema_migrations (version, applied_at) '
+                    "VALUES (?, datetime('now'))", (name,)
+                )
+                conn.execute('COMMIT')
+                return
+            except sqlite3.OperationalError:
+                try:
+                    conn.execute('ROLLBACK')
+                except sqlite3.OperationalError:
+                    pass
+                if attempt == 4:
+                    raise
+                time.sleep(0.2)
+        return
+
+    rebuild_fk = name == '0004_schema_revision'
+    for attempt in range(5):
+        if rebuild_fk:
+            conn.execute('PRAGMA foreign_keys = OFF')
         try:
-            conn.executescript(sql)  # still self-committing; keep simple
+            conn.execute('BEGIN IMMEDIATE')
+            if conn.execute(
+                'SELECT 1 FROM schema_migrations WHERE version=?', (name,)
+            ).fetchone():
+                conn.execute('ROLLBACK')
+                return
+            for stmt in _script_statements(sql):
+                conn.execute(stmt)
+            if rebuild_fk:
+                violations = conn.execute('PRAGMA foreign_key_check').fetchall()
+                if violations:
+                    raise StoreError(
+                        f'foreign-key violations after {name}: {violations[:5]}'
+                    )
+            conn.execute(
+                'INSERT INTO schema_migrations (version, applied_at) '
+                "VALUES (?, datetime('now'))", (name,)
+            )
+            conn.execute('COMMIT')
+            return
+        except sqlite3.OperationalError:
+            try:
+                conn.execute('ROLLBACK')
+            except sqlite3.OperationalError:
+                pass
+            if attempt == 4:
+                raise
+            time.sleep(0.2)
         except Exception:
             try:
                 conn.execute('ROLLBACK')
             except sqlite3.OperationalError:
                 pass
             raise
-    # Record the migration atomically
-    for attempt in range(5):
-        try:
-            conn.execute('BEGIN IMMEDIATE')
-            already = conn.execute(
-                'SELECT 1 FROM schema_migrations WHERE version = ?', (name,)
-            ).fetchone()
-            if already:
-                conn.execute('ROLLBACK')
-                return
-            conn.execute(
-                'INSERT INTO schema_migrations (version, applied_at) '
-                "VALUES (?, datetime('now'))",
-                (name,)
-            )
-            conn.execute('COMMIT')
-            return
-        except sqlite3.OperationalError:
-            if attempt == 4:
-                raise
-            time.sleep(0.2)
+        finally:
+            if rebuild_fk:
+                conn.execute('PRAGMA foreign_keys = ON')
 
 
 def check_migration_lock(conn):
-    """Return any active (stale) migration lock info for doctor."""
+    """Return active or stale crash-visible migration lock info for doctor."""
     try:
         cur = conn.execute(
             'SELECT version, lock_holder, lock_until FROM schema_migrations '
-            "WHERE lock_holder IS NOT NULL AND lock_until > ?",
-            (time.time(),)
+            'WHERE version=? AND lock_holder IS NOT NULL',
+            (_MIGRATION_LOCK_VERSION,)
         )
         return cur.fetchall()
     except sqlite3.OperationalError:
