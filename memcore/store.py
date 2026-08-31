@@ -157,6 +157,36 @@ BEGIN
 END;
 """
 
+_INGEST_JOURNAL = """
+CREATE TABLE IF NOT EXISTS ingest_event (
+    id                TEXT PRIMARY KEY,
+    project_id        TEXT NOT NULL REFERENCES project(id),
+    agent_id          TEXT NOT NULL REFERENCES agent(id),
+    session_id        TEXT NOT NULL DEFAULT '',
+    event_type        TEXT NOT NULL CHECK (event_type IN ('turn','memory_write','delegation','session_end','manual')),
+    user_content      TEXT NOT NULL DEFAULT '',
+    assistant_content TEXT NOT NULL DEFAULT '',
+    metadata          TEXT NOT NULL DEFAULT '{}',
+    content_hash      TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','processed','ignored','failed')),
+    decision          TEXT,
+    error             TEXT,
+    created_at        TEXT NOT NULL,
+    processed_at      TEXT,
+    UNIQUE(project_id, agent_id, session_id, content_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_ingest_event_status ON ingest_event(project_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_ingest_event_agent ON ingest_event(agent_id, created_at);
+CREATE TABLE IF NOT EXISTS ingest_derivation (
+    event_id   TEXT NOT NULL REFERENCES ingest_event(id) ON DELETE CASCADE,
+    memory_id  TEXT NOT NULL REFERENCES memory(id),
+    relation   TEXT NOT NULL CHECK (relation IN ('created','duplicate','evidence','corrected','ignored')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(event_id, memory_id, relation)
+);
+CREATE INDEX IF NOT EXISTS idx_ingest_derivation_memory ON ingest_derivation(memory_id);
+"""
+
 _INTEGRITY_HARDENING = """
 DROP TRIGGER IF EXISTS memory_version_created_at_iso;
 CREATE TRIGGER memory_version_created_at_iso BEFORE INSERT ON memory_version
@@ -189,6 +219,7 @@ ALTER TABLE tombstone_new RENAME TO tombstone;
 CREATE INDEX IF NOT EXISTS idx_tombstone_fingerprint ON tombstone(claim_fingerprint, scope);
 """),
     ('0007_integrity_hardening', _INTEGRITY_HARDENING),
+    ('0008_ingest_journal', _INGEST_JOURNAL),
 ]
 
 

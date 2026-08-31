@@ -8,15 +8,17 @@ uses the Python standard library for the core engine.
 ## Current status
 
 - Phase 1 core correctness: implemented and covered by the integration harness.
-- Phase 2 Hermes plugin: installed separately under the user plugin directory.
-- Phase 3+ lifecycle/source-aware features: incremental; see the planning repo.
-- Schema contract remains frozen; revisions are applied through migrations. Current schema revision: `0007_integrity_hardening`.
+- Hermes integration: native `MemCoreMemoryProvider` is active as `memory.provider: memcore`.
+- Automatic Hermes lifecycle writes enter an append-only ingest journal first; raw journal rows are never recalled directly.
+- Canonical recall preserves scope/lifecycle/verification/freshness trust labels across profiles.
+- Schema contract remains frozen; revisions are applied through migrations. Current schema revision: `0008_ingest_journal`.
 
 ## Repository layout
 
 ```text
 memcore/
 ├── memcore/core.py          # memory operations, search, GC, import, stats
+├── memcore/ingest.py        # append-only Hermes ingest journal + deterministic gate
 ├── memcore/store.py         # SQLite/WAL setup + migrations
 ├── memcore/__main__.py      # CLI + doctor
 ├── schema/schema.sql        # frozen initial contract
@@ -31,7 +33,7 @@ cd C:\Users\BlankScreen\Workspace\memcore
 python -m unittest discover -v
 ```
 
-Current full core gate: 152 tests pass, with the E12 token-budget pair remaining expected failures.
+Current full core gate: 164 tests pass, with the E12 token-budget pair remaining expected failures.
 The E12 token-budget pair remains an expected failure in the core harness
 because prompt-size enforcement lives in the Hermes plugin's recall builder.
 The plugin has its own budget regression tests.

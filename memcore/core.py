@@ -920,6 +920,12 @@ def stats(conn):
     ).fetchone()[0]
     fts_rows = one('SELECT COUNT(*) FROM memory_version_fts')
     ver_rows = one('SELECT COUNT(*) FROM memory_version')
+    has_journal = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ingest_event'"
+    ).fetchone() is not None
+    journal = dict(conn.execute(
+        'SELECT status, COUNT(*) FROM ingest_event GROUP BY status'
+    ).fetchall()) if has_journal else {}
     return {
         'memories_total': one('SELECT COUNT(*) FROM memory'),
         'by_lifecycle': by_lifecycle,
@@ -928,6 +934,7 @@ def stats(conn):
         'avg_summary_length': round(avg_len, 1) if avg_len is not None else 0.0,
         'fts': {'fts_rows': fts_rows, 'version_rows': ver_rows,
                 'in_sync': fts_rows == ver_rows},
+        'journal': journal,
     }
 
 
