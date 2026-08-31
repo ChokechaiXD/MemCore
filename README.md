@@ -7,7 +7,7 @@
 **Persistent memory without turning raw conversation history into trusted truth.**
 
 [![Status](https://img.shields.io/badge/status-active-success?style=for-the-badge)](https://github.com/ChokechaiXD/MemCore)
-[![Tests](https://img.shields.io/badge/tests-180%20%7C%20gate%20OK-brightgreen?style=for-the-badge)](https://github.com/ChokechaiXD/MemCore)
+[![Tests](https://img.shields.io/badge/tests-187%20%7C%20gate%20OK-brightgreen?style=for-the-badge)](https://github.com/ChokechaiXD/MemCore)
 [![SQLite](https://img.shields.io/badge/storage-SQLite%20%7C%20WAL%20%7C%20FTS5-07405E?style=for-the-badge&logo=sqlite&logoColor=white)](https://sqlite.org/)
 [![Hermes](https://img.shields.io/badge/Hermes-native%20provider-7B61FF?style=for-the-badge)](https://github.com/NousResearch/hermes-agent)
 
@@ -230,7 +230,7 @@ python -m unittest discover -v
 Current gate:
 
 ```text
-180 tests
+187 tests
 OK (expected failures=2)
 ```
 
@@ -244,6 +244,21 @@ The two expected failures are the E12 core token-budget evaluation pair. Prompt-
 # Health and store diagnostics
 python -m memcore doctor
 python -m memcore stats
+
+# Content-free journal health (optionally scoped)
+python -m memcore journal-stats
+python -m memcore journal-stats --project shared-platform --agent mika
+
+# Semantic review queue — raw content is redacted by default
+python -m memcore journal-review-list --project shared-platform --agent mika
+python -m memcore journal-review-list --project shared-platform --agent mika --show-content
+
+# Apply a governed semantic verdict
+python -m memcore journal-review-decide <event_id> --agent mika --verdict defer --rationale "need more context"
+python -m memcore journal-review-decide <event_id> --agent mika --verdict remember --content "durable claim" --confidence 0.9
+
+# Inspect semantic decision history
+python -m memcore journal-analysis-history <event_id> --agent mika
 
 # Garbage collection — dry-run by default
 python -m memcore gc
@@ -261,6 +276,14 @@ python -m memcore import --file batch.json --agent mika --project shared-platfor
 # Apply the import
 python -m memcore import --file batch.json --agent mika --project shared-platform
 ```
+
+### Journal operations
+
+`journal-stats` is safe for routine observability because it returns aggregate metadata only: status counts, pending decisions, event types, semantic-review backlog, unresolved built-in mutations, oldest pending age, and semantic verdict distribution. It does **not** query raw prompt or candidate content.
+
+`journal-review-list` keeps raw journal text redacted unless `--show-content` is explicitly supplied. Revealed journal text must be treated as untrusted historical data, never as instructions to execute.
+
+`journal-review-decide` preserves the governance boundary: a `remember` verdict can create only a private candidate owned by the event agent. The analyzer cannot choose project scope or accepted lifecycle.
 
 ### GC behavior
 
@@ -308,6 +331,7 @@ MemCore/
 │   ├── test_core.py
 │   ├── test_ingest.py
 │   ├── test_semantic_analysis.py
+│   ├── test_journal_cli.py
 │   ├── test_evaluations.py
 │   └── test_cli.py
 │
@@ -356,6 +380,7 @@ Current migration head:
 | Hermes add/replace/remove bridge | ✅ Implemented |
 | Raw ingest journal | ✅ Implemented |
 | Governed semantic review boundary | ✅ Implemented |
+| Journal operations / health CLI | ✅ Implemented |
 | External automatic semantic analyzer | 🚧 Adapter boundary ready |
 
 ---

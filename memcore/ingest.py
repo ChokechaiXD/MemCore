@@ -628,12 +628,120 @@ def process_event(conn, event_id):
         raise
 
 
-def journal_stats(conn, project_id=None):
-    where = ''
-    args = []
+def journal_stats(conn, project_id=None, agent_id=None):
+    """Return a content-free operational snapshot of the ingest journal.
+
+    The snapshot deliberately aggregates metadata only. It never returns raw user,
+    assistant, candidate, rationale, or event metadata content, making it suitable
+    for health checks and dashboards that should not expose historical prompts.
+    """
+    filters = []
+    params = []
     if project_id is not None:
-        where = ' WHERE project_id=?'
-        args.append(project_id)
-    return dict(conn.execute(
-        'SELECT status, COUNT(*) FROM ingest_event' + where + ' GROUP BY status', args
+        filters.append('project_id=?')
+        params.append(project_id)
+    if agent_id is not None:
+        filters.append('agent_id=?')
+        params.append(agent_id)
+    if project_id is not None and agent_id is not None:
+        core._require_membership(conn, project_id, agent_id)
+
+    where = (' WHERE ' + ' AND '.join(filters)) if filters else ''
+
+    def grouped(column, *, extra=''):
+        clauses = list(filters)
+        local_params = list(params)
+        if extra:
+            clauses.append(extra)
+        local_where = (' WHERE ' + ' AND '.join(clauses)) if clauses else ''
+        return dict(conn.execute(
+            f'SELECT {column}, COUNT(*) FROM ingest_event{local_where} '
+            f'GROUP BY {column} ORDER BY {column}', local_params
+        ).fetchall())
+
+    total = conn.execute(
+        'SELECT COUNT(*) FROM ingest_event' + where, params
+    ).fetchone()[0]
+    by_status = grouped('status')
+    pending_by_decision = grouped(
+        "COALESCE(decision, 'unclassified')", extra="status='pending'"
+    )
+    pending_by_event_type = grouped('event_type', extra="status='pending'")
+
+    pending_clauses = list(filters) + ["status='pending'"]
+    pending_where = ' WHERE ' + ' AND '.join(pending_clauses)
+    pending_params = list(params)
+    semantic_pending = conn.execute(
+        'SELECT COUNT(*) FROM ingest_event' + pending_where +
+        " AND decision IN ('semantic_review_required','semantic_deferred')",
+        pending_params
+    ).fetchone()[0]
+    unresolved_builtin = conn.execute(
+        'SELECT COUNT(*) FROM ingest_event' + pending_where +
+        " AND decision LIKE 'builtin_memory_%' "
+        "AND (decision LIKE '%_unresolved_target' "
+        "OR decision LIKE '%_missing_old_text' "
+        "OR decision='builtin_memory_replace_missing_content' "
+        "OR decision LIKE '%_requires_review')",
+        pending_params
+    ).fetchone()[0]
+    oldest = conn.execute(
+        'SELECT MIN(created_at) FROM ingest_event' + pending_where,
+        pending_params
+    ).fetchone()[0]
+    oldest_age_seconds = None
+    if oldest:
+        age = conn.execute(
+            "SELECT MAX(0, CAST(strftime('%s','now') AS INTEGER) - "
+            "CAST(strftime('%s', ?) AS INTEGER))",
+            (oldest,)
+        ).fetchone()[0]
+        oldest_age_seconds = int(age) if age is not None else None
+
+    analysis_filters = []
+    analysis_params = []
+    if project_id is not None:
+        analysis_filters.append('e.project_id=?')
+        analysis_params.append(project_id)
+    if agent_id is not None:
+        analysis_filters.append('e.agent_id=?')
+        analysis_params.append(agent_id)
+    analysis_where = (
+        ' WHERE ' + ' AND '.join(analysis_filters) if analysis_filters else ''
+    )
+    analysis_total = conn.execute(
+        'SELECT COUNT(*) FROM ingest_analysis a '
+        'JOIN ingest_event e ON e.id=a.event_id' + analysis_where,
+        analysis_params
+    ).fetchone()[0]
+    analysis_by_verdict = dict(conn.execute(
+        'SELECT a.verdict, COUNT(*) FROM ingest_analysis a '
+        'JOIN ingest_event e ON e.id=a.event_id' + analysis_where +
+        ' GROUP BY a.verdict ORDER BY a.verdict',
+        analysis_params
     ).fetchall())
+
+    if by_status.get('failed', 0):
+        health = 'failed'
+    elif unresolved_builtin:
+        health = 'operator_attention'
+    elif semantic_pending:
+        health = 'review_pending'
+    else:
+        health = 'ok'
+
+    return {
+        'health': health,
+        'total_events': total,
+        'by_status': by_status,
+        'pending_by_decision': pending_by_decision,
+        'pending_by_event_type': pending_by_event_type,
+        'semantic_review_pending': semantic_pending,
+        'unresolved_builtin_mutations': unresolved_builtin,
+        'oldest_pending_at': oldest,
+        'oldest_pending_age_seconds': oldest_age_seconds,
+        'analysis': {
+            'total': analysis_total,
+            'by_verdict': analysis_by_verdict,
+        },
+    }
