@@ -53,9 +53,20 @@ def append_event(conn, project_id, agent_id, event_type, *, session_id='',
         raise core.MemCoreError(f'invalid ingest event type: {event_type}')
     user_content = _clean_text(user_content)
     assistant_content = _clean_text(assistant_content)
-    if not user_content and not assistant_content:
-        raise core.MemCoreError('journal event must contain user or assistant content')
     metadata = metadata if isinstance(metadata, dict) else {}
+    memory_action = str(metadata.get('action') or '').strip().lower()
+    builtin_metadata = metadata.get('builtin_metadata')
+    old_text = metadata.get('old_text')
+    if not old_text and isinstance(builtin_metadata, dict):
+        old_text = builtin_metadata.get('old_text')
+    has_remove_reference = (
+        event_type == 'memory_write' and memory_action == 'remove'
+        and isinstance(old_text, str) and bool(old_text.strip())
+    )
+    if not user_content and not assistant_content and not has_remove_reference:
+        raise core.MemCoreError(
+            'journal event must contain user or assistant content, or a memory remove old_text'
+        )
     session_id = str(session_id or '')[:512]
     content_hash = _payload_hash(event_type, user_content, assistant_content, metadata)
     event_id = 'evt-' + hashlib.sha256(
@@ -112,12 +123,201 @@ def _find_private_claim(conn, project_id, agent_id, claim_fp):
     return None
 
 
+def _memory_write_reference(metadata):
+    """Return the strongest old-claim reference supplied by Hermes.
+
+    Current native adapters may preserve the original hook payload under
+    ``builtin_metadata``. Accept both the promoted and nested shapes so journal
+    replay remains compatible across adapter versions.
+    """
+    sources = [metadata]
+    nested = metadata.get('builtin_metadata')
+    if isinstance(nested, dict):
+        sources.append(nested)
+    for source in sources:
+        for key in ('matched_entry', 'old_text'):
+            value = source.get(key)
+            if isinstance(value, dict):
+                value = value.get('content') or value.get('text') or value.get('value')
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ''
+
+
+def _find_builtin_memory_target(conn, project_id, agent_id, old_text, target=''):
+    """Resolve exactly one active private memory previously derived from the built-in hook.
+
+    old_text is deliberately treated as a full-claim reference here. Hermes' built-in
+    tool may use substring matching internally, but reproducing that fuzzy lookup in a
+    second store can mutate the wrong memory. Uncertain matches remain pending.
+    """
+    claim_fp = core.fingerprint(old_text)
+    rows = conn.execute(
+        'SELECT m.id, v.content FROM memory m '
+        'JOIN memory_version v ON v.id=m.current_version_id '
+        "WHERE m.project_id=? AND m.scope='private' AND m.owner_agent_id=? "
+        "AND m.lifecycle IN ('candidate','accepted','conflict')",
+        (project_id, agent_id)
+    ).fetchall()
+    matches = []
+    for memory_id, content in rows:
+        if core.fingerprint(content) != claim_fp:
+            continue
+        origins = conn.execute(
+            'SELECT e.metadata FROM ingest_derivation d '
+            'JOIN ingest_event e ON e.id=d.event_id '
+            "WHERE d.memory_id=? AND e.event_type='memory_write'",
+            (memory_id,)
+        ).fetchall()
+        if not origins:
+            continue
+        if target:
+            target_match = False
+            for (raw_metadata,) in origins:
+                try:
+                    origin = json.loads(raw_metadata or '{}')
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    origin = {}
+                if str(origin.get('target') or '').strip().lower() == target:
+                    target_match = True
+                    break
+            if not target_match:
+                continue
+        matches.append(memory_id)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _mutation_audit_memory(conn, project_id, agent_id, event_id, action):
+    """Recover a mutation that committed before its journal status update."""
+    marker = f'ingest:{event_id}'
+    rows = conn.execute(
+        'SELECT memory_id, detail FROM audit_event '
+        'WHERE project_id=? AND actor_agent_id=? AND action=? ORDER BY id DESC',
+        (project_id, agent_id, action)
+    ).fetchall()
+    for memory_id, detail_raw in rows:
+        try:
+            detail = json.loads(detail_raw or '{}')
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if detail.get('reason') == marker:
+            return memory_id
+    return None
+
+
+def _finish_builtin_mutation(conn, event_id, memory_id, decision):
+    now = core._now()
+    conn.execute('BEGIN IMMEDIATE')
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO ingest_derivation "
+            "(event_id, memory_id, relation, created_at) VALUES (?, ?, 'corrected', ?)",
+            (event_id, memory_id, now)
+        )
+        conn.execute(
+            "UPDATE ingest_event SET status='processed', decision=?, error=NULL, processed_at=? "
+            'WHERE id=?',
+            (decision, now, event_id)
+        )
+        conn.execute('COMMIT')
+    except Exception:
+        try:
+            conn.execute('ROLLBACK')
+        except Exception:
+            pass
+        raise
+    return {'event_id': event_id, 'status': 'processed',
+            'decision': decision, 'memory_id': memory_id}
+
+
+def _process_builtin_mutation(conn, event_id):
+    row = conn.execute(
+        'SELECT project_id, agent_id, user_content, metadata, status '
+        'FROM ingest_event WHERE id=?', (event_id,)
+    ).fetchone()
+    if row is None:
+        raise core.MemCoreError(f'ingest event not found: {event_id}')
+    project_id, agent_id, user_content, metadata_raw, status = row
+    try:
+        metadata = json.loads(metadata_raw or '{}')
+    except (TypeError, ValueError, json.JSONDecodeError):
+        metadata = {}
+    core._require_membership(conn, project_id, agent_id)
+    if status != 'pending':
+        return {'event_id': event_id, 'status': status}
+
+    action = str(metadata.get('action') or '').strip().lower()
+    if action not in ('replace', 'remove'):
+        raise core.MemCoreError(f'not a built-in mutation event: {action or "unknown"}')
+    if metadata.get('success') is False:
+        now = core._now()
+        conn.execute(
+            "UPDATE ingest_event SET status='ignored', decision=?, processed_at=? WHERE id=?",
+            ('builtin_memory_write_failed_upstream', now, event_id)
+        )
+        return {'event_id': event_id, 'status': 'ignored',
+                'decision': 'builtin_memory_write_failed_upstream'}
+
+    audit_action = 'supersede' if action == 'replace' else 'reject'
+    recovered = _mutation_audit_memory(
+        conn, project_id, agent_id, event_id, audit_action
+    )
+    if recovered:
+        return _finish_builtin_mutation(
+            conn, event_id, recovered, f'builtin_memory_{action}d'
+        )
+
+    old_text = _memory_write_reference(metadata)
+    if not old_text:
+        decision = f'builtin_memory_{action}_missing_old_text'
+        conn.execute('UPDATE ingest_event SET decision=? WHERE id=?', (decision, event_id))
+        return {'event_id': event_id, 'status': 'pending', 'decision': decision}
+    target = str(metadata.get('target') or '').strip().lower()
+    memory_id = _find_builtin_memory_target(
+        conn, project_id, agent_id, old_text, target=target
+    )
+    if not memory_id:
+        decision = f'builtin_memory_{action}_unresolved_target'
+        conn.execute('UPDATE ingest_event SET decision=? WHERE id=?', (decision, event_id))
+        return {'event_id': event_id, 'status': 'pending', 'decision': decision}
+
+    marker = f'ingest:{event_id}'
+    if action == 'replace':
+        new_content = (user_content or '').strip()
+        if not new_content:
+            decision = 'builtin_memory_replace_missing_content'
+            conn.execute('UPDATE ingest_event SET decision=? WHERE id=?', (decision, event_id))
+            return {'event_id': event_id, 'status': 'pending', 'decision': decision}
+        core.supersede(conn, memory_id, agent_id, new_content, reason=marker)
+        decision = 'builtin_memory_replaced'
+    else:
+        # A durable remove is a refusal to retain this claim. Rejecting leaves only
+        # its fingerprint tombstone, preventing later journal replay from resurrecting it.
+        core.reject(conn, memory_id, agent_id, marker)
+        decision = 'builtin_memory_removed'
+    return _finish_builtin_mutation(conn, event_id, memory_id, decision)
+
+
 def process_event(conn, event_id):
     """Analyze one pending event after it is durable in the journal.
 
     Explicit durable user signals become private candidate memories. Ambiguous
     events stay pending for a future semantic analyzer or operator review.
     """
+    preview = conn.execute(
+        'SELECT event_type, metadata, status FROM ingest_event WHERE id=?', (event_id,)
+    ).fetchone()
+    if preview is None:
+        raise core.MemCoreError(f'ingest event not found: {event_id}')
+    event_type, metadata_raw, preview_status = preview
+    if preview_status == 'pending' and event_type == 'memory_write':
+        try:
+            preview_metadata = json.loads(metadata_raw or '{}')
+        except (TypeError, ValueError, json.JSONDecodeError):
+            preview_metadata = {}
+        if str(preview_metadata.get('action') or '').strip().lower() in ('replace', 'remove'):
+            return _process_builtin_mutation(conn, event_id)
+
     conn.execute('BEGIN IMMEDIATE')
     try:
         row = conn.execute(
@@ -136,7 +336,11 @@ def process_event(conn, event_id):
             conn.execute('ROLLBACK')
             return {'event_id': event_id, 'status': status}
 
-        if event_type == 'memory_write' and user_content.strip():
+        if event_type == 'memory_write' and metadata.get('success') is False:
+            decision, reason, candidate = (
+                'ignore', 'builtin_memory_write_failed_upstream', ''
+            )
+        elif event_type == 'memory_write' and user_content.strip():
             action = str(metadata.get('action') or 'add').strip().lower()
             if action == 'add':
                 decision, reason, candidate = (

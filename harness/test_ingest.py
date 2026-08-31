@@ -166,22 +166,179 @@ class TestIngestJournal(IngestTestBase):
         stats = core.stats(self.conn)
         self.assertEqual(stats['journal'].get('pending'), 1)
 
-    def test_builtin_remove_stays_pending_instead_of_recreating_memory(self):
+    def _add_builtin_memory(self, content, *, target='memory', session_id='builtin-add'):
+        event_id, _ = ingest.append_event(
+            self.conn, self.project, self.alice, 'memory_write', session_id=session_id,
+            user_content=content, metadata={'action': 'add', 'target': target, 'success': True}
+        )
+        return ingest.process_event(self.conn, event_id)
+
+    def test_builtin_remove_accepts_empty_content_and_rejects_exact_prior_hook_memory(self):
+        added = self._add_builtin_memory('old built-in memory entry', session_id='rm-add')
         event_id, _ = ingest.append_event(
             self.conn, self.project, self.alice, 'memory_write', session_id='rm1',
-            user_content='old built-in memory entry', metadata={'action': 'remove'}
+            metadata={
+                'action': 'remove', 'target': 'memory',
+                'old_text': 'old built-in memory entry', 'success': True,
+            }
         )
         result = ingest.process_event(self.conn, event_id)
-        self.assertEqual(result['status'], 'pending')
-        self.assertEqual(result['decision'], 'builtin_memory_remove_requires_review')
-        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM memory').fetchone()[0], 0)
+        self.assertEqual(result['status'], 'processed')
+        self.assertEqual(result['decision'], 'builtin_memory_removed')
+        self.assertEqual(result['memory_id'], added['memory_id'])
+        lifecycle = self.conn.execute(
+            'SELECT lifecycle FROM memory WHERE id=?', (added['memory_id'],)
+        ).fetchone()[0]
+        self.assertEqual(lifecycle, 'rejected')
+        self.assertEqual(core.search(
+            self.conn, self.project, self.alice, 'old built-in memory entry'
+        ), [])
+        tombstone = self.conn.execute(
+            'SELECT scope FROM tombstone WHERE claim_fingerprint=?',
+            (core.fingerprint('old built-in memory entry'),)
+        ).fetchone()
+        self.assertEqual(
+            tombstone[0], core._private_tombstone_scope(self.project, self.alice)
+        )
 
-    def test_builtin_replace_stays_pending_for_correction_analysis(self):
+    def test_builtin_replace_supersedes_exact_prior_hook_memory(self):
+        added = self._add_builtin_memory('legacyzebra preference', target='user', session_id='rp-add')
         event_id, _ = ingest.append_event(
             self.conn, self.project, self.alice, 'memory_write', session_id='rp1',
-            user_content='replacement built-in memory entry', metadata={'action': 'replace'}
+            user_content='freshquasar preference', metadata={
+                'action': 'replace', 'target': 'user',
+                'old_text': 'legacyzebra preference', 'success': True,
+            }
+        )
+        result = ingest.process_event(self.conn, event_id)
+        self.assertEqual(result['status'], 'processed')
+        self.assertEqual(result['decision'], 'builtin_memory_replaced')
+        self.assertEqual(result['memory_id'], added['memory_id'])
+        row = self.conn.execute(
+            'SELECT m.lifecycle, v.content FROM memory m JOIN memory_version v '
+            'ON v.id=m.current_version_id WHERE m.id=?', (added['memory_id'],)
+        ).fetchone()
+        self.assertEqual(row, ('candidate', 'freshquasar preference'))
+        self.assertEqual(core.search(
+            self.conn, self.project, self.alice, 'legacyzebra'
+        ), [])
+        self.assertEqual(len(core.search(
+            self.conn, self.project, self.alice, 'freshquasar'
+        )), 1)
+
+    def test_builtin_replace_accepts_nested_adapter_old_text(self):
+        added = self._add_builtin_memory('nested legacy claim', session_id='nested-add')
+        event_id, _ = ingest.append_event(
+            self.conn, self.project, self.alice, 'memory_write', session_id='nested-rp',
+            user_content='nested current claim', metadata={
+                'action': 'replace', 'target': 'memory',
+                'builtin_metadata': {'old_text': 'nested legacy claim'},
+            }
+        )
+        result = ingest.process_event(self.conn, event_id)
+        self.assertEqual(result['status'], 'processed')
+        self.assertEqual(result['decision'], 'builtin_memory_replaced')
+        self.assertEqual(result['memory_id'], added['memory_id'])
+        self.assertEqual(len(core.search(
+            self.conn, self.project, self.alice, 'nested current claim'
+        )), 1)
+
+    def test_builtin_remove_journals_nested_old_text_without_content(self):
+        event_id, _ = ingest.append_event(
+            self.conn, self.project, self.alice, 'memory_write', session_id='nested-rm',
+            metadata={
+                'action': 'remove', 'target': 'memory',
+                'builtin_metadata': {'old_text': 'nested remove reference'},
+            }
+        )
+        row = self.conn.execute(
+            'SELECT status FROM ingest_event WHERE id=?', (event_id,)
+        ).fetchone()
+        self.assertEqual(row[0], 'pending')
+
+    def test_builtin_replace_without_exact_hook_origin_stays_pending(self):
+        core.create_memory(
+            self.conn, self.project, self.alice, 'conversation-derived claim',
+            scope='private'
+        )
+        event_id, _ = ingest.append_event(
+            self.conn, self.project, self.alice, 'memory_write', session_id='rp-unresolved',
+            user_content='replacement claim', metadata={
+                'action': 'replace', 'target': 'memory',
+                'old_text': 'conversation-derived claim', 'success': True,
+            }
         )
         result = ingest.process_event(self.conn, event_id)
         self.assertEqual(result['status'], 'pending')
-        self.assertEqual(result['decision'], 'builtin_memory_replace_requires_review')
+        self.assertEqual(result['decision'], 'builtin_memory_replace_unresolved_target')
+        self.assertEqual(len(core.search(
+            self.conn, self.project, self.alice, 'conversation-derived claim'
+        )), 1)
+
+    def test_builtin_remove_with_substring_reference_stays_pending(self):
+        self._add_builtin_memory(
+            'the complete durable memory claim', session_id='substring-add'
+        )
+        event_id, _ = ingest.append_event(
+            self.conn, self.project, self.alice, 'memory_write', session_id='substring-rm',
+            metadata={
+                'action': 'remove', 'target': 'memory',
+                'old_text': 'durable memory', 'success': True,
+            }
+        )
+        result = ingest.process_event(self.conn, event_id)
+        self.assertEqual(result['status'], 'pending')
+        self.assertEqual(result['decision'], 'builtin_memory_remove_unresolved_target')
+        self.assertEqual(len(core.search(
+            self.conn, self.project, self.alice, 'complete durable memory claim'
+        )), 1)
+
+    def test_failed_upstream_add_is_ignored_without_creating_memory(self):
+        event_id, _ = ingest.append_event(
+            self.conn, self.project, self.alice, 'memory_write', session_id='failed-add-only',
+            user_content='must not be persisted', metadata={
+                'action': 'add', 'target': 'memory', 'success': False,
+            }
+        )
+        result = ingest.process_event(self.conn, event_id)
+        self.assertEqual(result['status'], 'ignored')
+        self.assertEqual(result['decision'], 'builtin_memory_write_failed_upstream')
         self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM memory').fetchone()[0], 0)
+
+    def test_mutation_replay_recovers_from_audit_marker(self):
+        added = self._add_builtin_memory('recoverable old claim', session_id='recover-add')
+        event_id, _ = ingest.append_event(
+            self.conn, self.project, self.alice, 'memory_write', session_id='recover-rp',
+            user_content='recoverable new claim', metadata={
+                'action': 'replace', 'target': 'memory',
+                'old_text': 'recoverable old claim', 'success': True,
+            }
+        )
+        core.supersede(
+            self.conn, added['memory_id'], self.alice, 'recoverable new claim',
+            reason=f'ingest:{event_id}'
+        )
+        result = ingest.process_event(self.conn, event_id)
+        self.assertEqual(result['status'], 'processed')
+        self.assertEqual(result['decision'], 'builtin_memory_replaced')
+        self.assertEqual(result['memory_id'], added['memory_id'])
+        relation = self.conn.execute(
+            'SELECT relation FROM ingest_derivation WHERE event_id=?', (event_id,)
+        ).fetchone()[0]
+        self.assertEqual(relation, 'corrected')
+
+    def test_failed_upstream_memory_write_is_ignored(self):
+        self._add_builtin_memory('keep this built-in entry', session_id='failed-add')
+        event_id, _ = ingest.append_event(
+            self.conn, self.project, self.alice, 'memory_write', session_id='failed-rm',
+            metadata={
+                'action': 'remove', 'target': 'memory',
+                'old_text': 'keep this built-in entry', 'success': False,
+            }
+        )
+        result = ingest.process_event(self.conn, event_id)
+        self.assertEqual(result['status'], 'ignored')
+        self.assertEqual(result['decision'], 'builtin_memory_write_failed_upstream')
+        self.assertEqual(len(core.search(
+            self.conn, self.project, self.alice, 'keep this built-in entry'
+        )), 1)
