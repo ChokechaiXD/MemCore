@@ -103,6 +103,56 @@ def _discover_hermes_memcore_bindings():
     return {'available': True, 'root': str(root), 'bindings': bindings, 'errors': errors}
 
 
+def _resolve_project_ref(conn, project_ref):
+    """Resolve exact project id/UUID or a unique project name/slug."""
+    direct = conn.execute(
+        'SELECT id FROM project WHERE id=?', (project_ref,)
+    ).fetchone()
+    if direct:
+        return direct[0], None
+    by_name = conn.execute(
+        'SELECT id FROM project WHERE name=? ORDER BY id', (project_ref,)
+    ).fetchall()
+    if len(by_name) > 1:
+        return None, f'ambiguous_project:{project_ref}'
+    if by_name:
+        return by_name[0][0], None
+    legacy = f'proj-{project_ref}'
+    row = conn.execute('SELECT id FROM project WHERE id=?', (legacy,)).fetchone()
+    return (row[0], None) if row else (None, f'missing_project:{project_ref}')
+
+
+def _project_or_exit(conn, project_ref):
+    pid, error = _resolve_project_ref(conn, project_ref)
+    if error:
+        sys.exit(f'error: {error}')
+    return pid
+
+
+def _agent_identity_or_exit(conn, agent_name):
+    """Return (agent_id, exists) only if deterministic identity is unambiguous."""
+    aid = f'agent-{agent_name}'
+    by_id = conn.execute(
+        'SELECT name, profile_key FROM agent WHERE id=?', (aid,)
+    ).fetchone()
+    if by_id is not None:
+        if by_id != (agent_name, agent_name):
+            sys.exit(
+                f'error: agent id {aid} has different identity '
+                f'(name={by_id[0]}, profile_key={by_id[1]})'
+            )
+        return aid, True
+    by_profile = conn.execute(
+        'SELECT id, name FROM agent WHERE profile_key=?', (agent_name,)
+    ).fetchone()
+    if by_profile is not None:
+        sys.exit(
+            f'error: profile_key {agent_name} already belongs to agent '
+            f'{by_profile[0]} ({by_profile[1]})'
+        )
+    return aid, False
+
+
 # ── setup subcommands ──────────────────────────────────────────────────
 
 def cmd_init(args):
@@ -114,13 +164,32 @@ def cmd_init(args):
 def cmd_project_add(args):
     conn = _open(args)
     pid = f'proj-{args.name}'
-    conn.execute(
-        'INSERT OR IGNORE INTO project (id, name, description) VALUES (?, ?, ?)',
-        (pid, args.name, args.description)
-    )
-    conn.commit()
-    conn.close()
-    print(f'project: {pid}')
+    try:
+        by_id = conn.execute(
+            'SELECT name FROM project WHERE id=?', (pid,)
+        ).fetchone()
+        if by_id is not None:
+            if by_id[0] != args.name:
+                sys.exit(
+                    f'error: project id {pid} already exists with name {by_id[0]}'
+                )
+            print(f'project: {pid}')
+            return
+        by_name = conn.execute(
+            'SELECT id FROM project WHERE name=? ORDER BY id', (args.name,)
+        ).fetchall()
+        if by_name:
+            sys.exit(
+                f'error: project name {args.name} already belongs to '
+                f'{", ".join(row[0] for row in by_name)}'
+            )
+        conn.execute(
+            'INSERT INTO project (id, name, description) VALUES (?, ?, ?)',
+            (pid, args.name, args.description)
+        )
+        print(f'project: {pid}')
+    finally:
+        conn.close()
 
 
 def cmd_project_list(args):
@@ -134,24 +203,24 @@ def cmd_project_list(args):
 
 def cmd_agent_add(args):
     conn = _open(args)
-    aid = f'agent-{args.name}'
-    conn.execute(
-        'INSERT OR IGNORE INTO agent (id, name, profile_key) VALUES (?, ?, ?)',
-        (aid, args.name, args.name)
-    )
-    conn.commit()
-    conn.close()
-    print(f'agent: {aid}')
+    try:
+        aid, exists = _agent_identity_or_exit(conn, args.name)
+        if not exists:
+            conn.execute(
+                'INSERT INTO agent (id, name, profile_key) VALUES (?, ?, ?)',
+                (aid, args.name, args.name)
+            )
+        print(f'agent: {aid}')
+    finally:
+        conn.close()
 
 
 def cmd_member_add(args):
     conn = _open(args)
-    pid = f'proj-{args.project}'
-    aid = f'agent-{args.agent}'
     try:
-        if not conn.execute('SELECT 1 FROM project WHERE id=?', (pid,)).fetchone():
-            sys.exit(f'error: project {pid} does not exist')
-        if not conn.execute('SELECT 1 FROM agent WHERE id=?', (aid,)).fetchone():
+        pid = _project_or_exit(conn, args.project)
+        aid, agent_exists = _agent_identity_or_exit(conn, args.agent)
+        if not agent_exists:
             sys.exit(f'error: agent {aid} does not exist; create it first')
         conn.execute('BEGIN IMMEDIATE')
         row = conn.execute(
@@ -195,10 +264,14 @@ def cmd_member_add(args):
 def cmd_remember(args):
     conn = _open(args)
     try:
+        project_id = _project_or_exit(conn, args.project)
+        agent_id, agent_exists = _agent_identity_or_exit(conn, args.agent)
+        if not agent_exists:
+            sys.exit(f'error: agent {agent_id} does not exist; create it first')
         mem_id, ver_id = core.create_memory(
             conn,
-            project_id=f'proj-{args.project}',
-            agent_id=f'agent-{args.agent}',
+            project_id=project_id,
+            agent_id=agent_id,
             content=args.content,
             scope=args.scope,
             memory_type=args.type,
@@ -215,10 +288,14 @@ def cmd_remember(args):
 def cmd_search(args):
     conn = _open_readonly(args)
     try:
+        project_id = _project_or_exit(conn, args.project)
+        agent_id, agent_exists = _agent_identity_or_exit(conn, args.agent)
+        if not agent_exists:
+            sys.exit(f'error: agent {agent_id} does not exist; create it first')
         rows = core.search(
             conn,
-            project_id=f'proj-{args.project}',
-            agent_id=f'agent-{args.agent}',
+            project_id=project_id,
+            agent_id=agent_id,
             query=args.query,
             limit=args.limit,
         )
@@ -236,7 +313,10 @@ def cmd_search(args):
 def cmd_promote(args):
     conn = _open(args)
     try:
-        core.promote(conn, args.memory_id, f'agent-{args.agent}')
+        agent_id, exists = _agent_identity_or_exit(conn, args.agent)
+        if not exists:
+            sys.exit(f'error: agent {agent_id} does not exist; create it first')
+        core.promote(conn, args.memory_id, agent_id)
         print(f'promoted: {args.memory_id} -> project scope')
     except core.MemCoreError as e:
         sys.exit(f'error: {e}')
@@ -247,8 +327,11 @@ def cmd_promote(args):
 def cmd_supersede(args):
     conn = _open(args)
     try:
+        agent_id, exists = _agent_identity_or_exit(conn, args.agent)
+        if not exists:
+            sys.exit(f'error: agent {agent_id} does not exist; create it first')
         new_ver = core.supersede(
-            conn, args.memory_id, f'agent-{args.agent}',
+            conn, args.memory_id, agent_id,
             args.content, reason=args.reason
         )
         print(f'superseded: {args.memory_id} -> new version {new_ver}')
@@ -261,7 +344,10 @@ def cmd_supersede(args):
 def cmd_deactivate(args):
     conn = _open(args)
     try:
-        core.deactivate(conn, args.memory_id, f'agent-{args.agent}')
+        agent_id, exists = _agent_identity_or_exit(conn, args.agent)
+        if not exists:
+            sys.exit(f'error: agent {agent_id} does not exist; create it first')
+        core.deactivate(conn, args.memory_id, agent_id)
         print(f'deactivated: {args.memory_id}')
     except core.MemCoreError as e:
         sys.exit(f'error: {e}')
@@ -272,8 +358,25 @@ def cmd_deactivate(args):
 def cmd_reject(args):
     conn = _open(args)
     try:
-        core.reject(conn, args.memory_id, f'agent-{args.agent}', args.reason)
+        agent_id, exists = _agent_identity_or_exit(conn, args.agent)
+        if not exists:
+            sys.exit(f'error: agent {agent_id} does not exist; create it first')
+        core.reject(conn, args.memory_id, agent_id, args.reason)
         print(f'rejected + tombstoned: {args.memory_id}')
+    except core.MemCoreError as e:
+        sys.exit(f'error: {e}')
+    finally:
+        conn.close()
+
+
+def cmd_tombstone_override(args):
+    conn = _open(args)
+    try:
+        agent_id, exists = _agent_identity_or_exit(conn, args.agent)
+        if not exists:
+            sys.exit(f'error: agent {agent_id} does not exist; create it first')
+        changed = core.override_tombstone(conn, args.tombstone_id, agent_id)
+        print(('overridden' if changed else 'already overridden') + f': {args.tombstone_id}')
     except core.MemCoreError as e:
         sys.exit(f'error: {e}')
     finally:
@@ -297,26 +400,29 @@ def cmd_gc(args):
         )
 
         print('GC scan:')
-        print(f'  candidates (lifecycle=candidate, no evidence, age >{args.candidate_days}d): {len(candidates)}')
+        print(
+            f'  candidates (candidate, no evidence, unpinned/non-critical, '
+            f'inactive >{args.candidate_days}d): {len(candidates)}'
+        )
         if candidates:
             for c in candidates:
-                print(f'    {c[0]} (project={c[1]}, created={c[4]})')
+                print(f'    {c[0]} (project={c[1]}, last_updated={c[4]})')
 
-        print(f'  tombstones (age >{args.tombstone_days}d): {len(tombstones)}')
+        print(f'  overridden tombstones (age >{args.tombstone_days}d): {len(tombstones)}')
         if tombstones:
             for t in tombstones:
                 print(f'    {t[0]} (fingerprint={t[1][:8]}..., reason={t[3]})')
 
         if args.apply:
-            tombstoned, purged = core.gc_apply(
+            disabled, purged = core.gc_apply(
                 conn,
                 candidate_days=args.candidate_days,
                 tombstone_days=args.tombstone_days
             )
-            print(f'  applied: {len(tombstoned)} tombstoned, {len(purged)} purged')
-            if tombstoned:
-                for tid in tombstoned:
-                    print(f'    tombstoned: {tid}')
+            print(f'  applied: {len(disabled)} disabled, {len(purged)} purged')
+            if disabled:
+                for memory_id in disabled:
+                    print(f'    disabled: {memory_id}')
             if purged:
                 for tid in purged:
                     print(f'    purged: {tid}')
@@ -353,24 +459,16 @@ def cmd_import(args):
         if not isinstance(items, list):
             sys.exit('error: import file must contain a JSON array of items')
         
-        project_id = f'proj-{args.project}'
-        agent_id = f'agent-{args.agent}'
-
         # Operator-run CLI: project identity is never invented during import.
-        # The agent may be created, but membership is explicit and audited.
-        if not conn.execute(
-            'SELECT 1 FROM project WHERE id=?', (project_id,)
-        ).fetchone():
-            conn.close()
-            sys.exit(f'error: project {project_id} does not exist; create it first')
+        # Accept exact project IDs/UUIDs or a unique name/slug, matching plugin
+        # binding semantics.
+        project_id = _project_or_exit(conn, args.project)
 
         if dry_run:
+            agent_id, agent_exists = _agent_identity_or_exit(conn, args.agent)
             plan = core.plan_import(
                 conn, items, project_id, scope=args.scope, agent_id=agent_id
             )
-            agent_exists = bool(conn.execute(
-                'SELECT 1 FROM agent WHERE id=?', (agent_id,)
-            ).fetchone())
             member_exists = bool(conn.execute(
                 'SELECT 1 FROM project_membership WHERE project_id=? AND agent_id=?',
                 (project_id, agent_id)
@@ -389,10 +487,12 @@ def cmd_import(args):
 
         conn.execute('BEGIN IMMEDIATE')
         try:
-            conn.execute(
-                'INSERT OR IGNORE INTO agent (id, name, profile_key) VALUES (?, ?, ?)',
-                (agent_id, args.agent, args.agent)
-            )
+            agent_id, agent_exists = _agent_identity_or_exit(conn, args.agent)
+            if not agent_exists:
+                conn.execute(
+                    'INSERT INTO agent (id, name, profile_key) VALUES (?, ?, ?)',
+                    (agent_id, args.agent, args.agent)
+                )
             joined = conn.execute(
                 'INSERT OR IGNORE INTO project_membership (project_id, agent_id, role) '
                 "VALUES (?, ?, 'member')",
@@ -484,7 +584,7 @@ def cmd_doctor(args):
         '       AND m.project_id != ik.project_id)'
     ).fetchone()[0]
 
-    # 4. Tombstone stats
+    # 4. Tombstone/refusal-guard integrity.
     report['tombstones'] = {
         'active': conn.execute(
             'SELECT COUNT(*) FROM tombstone WHERE overridden_by IS NULL'
@@ -493,8 +593,43 @@ def cmd_doctor(args):
             'SELECT COUNT(*) FROM tombstone WHERE overridden_by IS NOT NULL'
         ).fetchone()[0],
     }
+    report['unguarded_rejected_memories'] = []
+    rejected_rows = conn.execute(
+        'SELECT m.id, m.project_id, m.scope, m.owner_agent_id, v.content '
+        'FROM memory m JOIN memory_version v ON v.id=m.current_version_id '
+        "WHERE m.lifecycle='rejected' ORDER BY m.id"
+    ).fetchall()
+    for memory_id, project_id, scope, owner_agent_id, content in rejected_rows:
+        if core._tombstone_active(
+            conn, core.fingerprint(content), project_id,
+            scope=scope, agent_id=owner_agent_id
+        ) is None:
+            report['unguarded_rejected_memories'].append(memory_id)
 
-    # 5. Membership listing + identity collision check.
+    # Tombstone.scope is an encoded reference rather than an FK. Validate both
+    # the reference shape and fingerprint so a typo cannot silently disable a
+    # refusal guard.
+    project_ids = {row[0] for row in conn.execute('SELECT id FROM project')}
+    agent_ids = {row[0] for row in conn.execute('SELECT id FROM agent')}
+    report['tombstone_violations'] = []
+    for tomb_id, claim_fp, scope in conn.execute(
+        'SELECT id, claim_fingerprint, scope FROM tombstone ORDER BY id'
+    ):
+        reasons = []
+        if len(claim_fp) != 16 or any(ch not in '0123456789abcdef' for ch in claim_fp):
+            reasons.append('invalid_fingerprint')
+        if scope == 'global' or scope in project_ids:
+            pass
+        elif scope.startswith('private:'):
+            parts = scope.split(':', 2)
+            if len(parts) != 3 or parts[1] not in project_ids or parts[2] not in agent_ids:
+                reasons.append('invalid_private_scope')
+        else:
+            reasons.append('invalid_scope')
+        if reasons:
+            report['tombstone_violations'].append((tomb_id, scope, reasons))
+
+    # 5. Membership listing + identity/project-name collision checks.
     report['memberships'] = conn.execute(
         'SELECT p.name, a.name, pm.role FROM project_membership pm '
         'JOIN project p ON p.id = pm.project_id '
@@ -506,6 +641,10 @@ def cmd_doctor(args):
         'JOIN agent a ON a.id=pm.agent_id '
         'GROUP BY pm.project_id, a.name HAVING COUNT(*) > 1 '
         'ORDER BY p.name, a.name'
+    ).fetchall()
+    report['project_name_collisions'] = conn.execute(
+        'SELECT name, COUNT(*), GROUP_CONCAT(id, ",") FROM project '
+        'GROUP BY name HAVING COUNT(*) > 1 ORDER BY name'
     ).fetchall()
 
     # 6. Enabled Hermes profile bindings must resolve into this exact store.
@@ -526,9 +665,9 @@ def cmd_doctor(args):
             if not projects:
                 reasons.append('missing_project_binding')
             for project in projects:
-                pid = f'proj-{project}'
-                if not conn.execute('SELECT 1 FROM project WHERE id=?', (pid,)).fetchone():
-                    reasons.append(f'missing_project:{project}')
+                pid, project_error = _resolve_project_ref(conn, project)
+                if project_error:
+                    reasons.append(project_error)
                     continue
                 if agent:
                     aid = f'agent-{agent}'
@@ -572,10 +711,16 @@ def cmd_doctor(args):
     print(f"idempotency violations: {report['idempotency_violations']}")
     print(f"tombstones: {report['tombstones']['active']} active, "
           f"{report['tombstones']['overridden']} overridden")
+    print(
+        f"unguarded rejected memories: "
+        f"{report['unguarded_rejected_memories'] or 'none'}"
+    )
+    print(f"tombstone violations: {report['tombstone_violations'] or 'none'}")
     print('memberships:')
     for name, agent, role in report['memberships']:
         print(f'  {name}: {agent} ({role})')
     print(f"agent name collisions: {report['agent_name_collisions'] or 'none'}")
+    print(f"project name collisions: {report['project_name_collisions'] or 'none'}")
     if report['config_check'].get('available'):
         print('config bindings:')
         drift_by_profile = {
@@ -603,7 +748,10 @@ def cmd_doctor(args):
         or report['orphaned_memory_versions'] > 0
         or report['orphaned_audit_events'] > 0
         or report['idempotency_violations'] > 0
+        or report['unguarded_rejected_memories']
+        or report['tombstone_violations']
         or report['agent_name_collisions']
+        or report['project_name_collisions']
         or report['binding_drift']
         or report['config_check'].get('errors')
         or not report['store_parent_writable']
@@ -641,13 +789,14 @@ def main(argv=None):
     p = sub.add_parser('member', help='membership management')
     psub = p.add_subparsers(dest='subcommand', required=True)
     pa = psub.add_parser('add')
-    pa.add_argument('project')
+    pa.add_argument('project', help='project id/UUID or unique name/slug')
     pa.add_argument('agent')
     pa.add_argument('--role', default='member', choices=['member', 'owner'])
     pa.set_defaults(func=cmd_member_add)
 
     p = sub.add_parser('remember', help='store a memory')
-    p.add_argument('--project', required=True)
+    p.add_argument('--project', required=True,
+                   help='project id/UUID or unique name/slug')
     p.add_argument('--agent', required=True)
     p.add_argument('content')
     p.add_argument('--scope', default='private', choices=['project', 'private'])
@@ -657,7 +806,8 @@ def main(argv=None):
     p.set_defaults(func=cmd_remember)
 
     p = sub.add_parser('search', help='FTS5 search over memories')
-    p.add_argument('--project', required=True)
+    p.add_argument('--project', required=True,
+                   help='project id/UUID or unique name/slug')
     p.add_argument('--agent', required=True)
     p.add_argument('query')
     p.add_argument('--limit', type=int, default=20)
@@ -686,11 +836,18 @@ def main(argv=None):
     p.add_argument('reason')
     p.set_defaults(func=cmd_reject)
 
-    p = sub.add_parser('gc', help='garbage collection: retention sweep')
+    p = sub.add_parser('tombstone', help='tombstone management')
+    tsub = p.add_subparsers(dest='subcommand', required=True)
+    to = tsub.add_parser('override', help='explicitly override an active refusal guard')
+    to.add_argument('tombstone_id')
+    to.add_argument('--agent', required=True)
+    to.set_defaults(func=cmd_tombstone_override)
+
+    p = sub.add_parser('gc', help='retention sweep (reversible for memories)')
     p.add_argument('--candidate-days', type=int, default=30,
-                   help="candidate memories older than N days with no evidence are gc'd (default 30)")
+                   help='inactive unevidenced candidates older than N days are disabled (default 30)')
     p.add_argument('--tombstone-days', type=int, default=90,
-                   help='tombstones older than N days are purged (default 90)')
+                   help='overridden tombstones older than N days are purged (default 90)')
     p.add_argument('--apply', action='store_true',
                    help='perform the sweep (dry-run otherwise)')
     p.set_defaults(func=cmd_gc)
@@ -700,7 +857,8 @@ def main(argv=None):
     p = sub.add_parser('import', help='import memories from JSON')
     p.add_argument('--file', required=True, help='JSON file path')
     p.add_argument('--agent', required=True, help='agent name')
-    p.add_argument('--project', required=True, help='project name')
+    p.add_argument('--project', required=True,
+                   help='project id/UUID or unique name/slug')
     p.add_argument('--scope', default='project', choices=['project', 'private'],
                    help='scope for imported memories (default project)')
     p.add_argument('--dry-run', action='store_true',

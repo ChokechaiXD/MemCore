@@ -157,6 +157,17 @@ BEGIN
 END;
 """
 
+_INTEGRITY_HARDENING = """
+DROP TRIGGER IF EXISTS memory_version_created_at_iso;
+CREATE TRIGGER memory_version_created_at_iso BEFORE INSERT ON memory_version
+WHEN new.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
+ AND new.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+BEGIN
+  SELECT RAISE(ABORT, 'invalid memory_version.created_at');
+END;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_name_unique ON project(name);
+"""
+
 MIGRATIONS = [
     ('0001_initial_contract', None),  # None = apply schema.sql verbatim
     ('0002_fts_sync_triggers', _FTS_TRIGGERS),
@@ -177,6 +188,7 @@ DROP TABLE tombstone;
 ALTER TABLE tombstone_new RENAME TO tombstone;
 CREATE INDEX IF NOT EXISTS idx_tombstone_fingerprint ON tombstone(claim_fingerprint, scope);
 """),
+    ('0007_integrity_hardening', _INTEGRITY_HARDENING),
 ]
 
 
@@ -424,10 +436,9 @@ def _script_statements(sql):
 def _apply_migration(conn, name, sql):
     """Apply one migration and its bookkeeping safely.
 
-    The frozen schema bootstrap still uses executescript because it contains
-    connection PRAGMAs. Later migrations are executed statement-by-statement
-    inside one explicit transaction, with the migration row committed in the
-    same transaction. Table-rebuild migration 0004 temporarily disables FK
+    All migrations, including the frozen schema bootstrap, are executed
+    statement-by-statement inside one explicit transaction, with bookkeeping
+    committed atomically. Table-rebuild migration 0004 temporarily disables FK
     enforcement and runs foreign_key_check before commit, per SQLite guidance.
     """
     already = conn.execute(
@@ -437,30 +448,7 @@ def _apply_migration(conn, name, sql):
         return
 
     if sql is None:
-        conn.executescript(SCHEMA_PATH.read_text(encoding='utf-8'))
-        for attempt in range(5):
-            try:
-                conn.execute('BEGIN IMMEDIATE')
-                if conn.execute(
-                    'SELECT 1 FROM schema_migrations WHERE version=?', (name,)
-                ).fetchone():
-                    conn.execute('ROLLBACK')
-                    return
-                conn.execute(
-                    'INSERT INTO schema_migrations (version, applied_at) '
-                    "VALUES (?, datetime('now'))", (name,)
-                )
-                conn.execute('COMMIT')
-                return
-            except sqlite3.OperationalError:
-                try:
-                    conn.execute('ROLLBACK')
-                except sqlite3.OperationalError:
-                    pass
-                if attempt == 4:
-                    raise
-                time.sleep(0.2)
-        return
+        sql = SCHEMA_PATH.read_text(encoding='utf-8')
 
     rebuild_fk = name == '0004_schema_revision'
     for attempt in range(5):

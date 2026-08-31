@@ -113,6 +113,83 @@ class CliImportTests(unittest.TestCase):
                 cli.main(['--db', missing] + command)
             self.assertFalse(os.path.exists(missing))
 
+    def test_agent_add_does_not_false_succeed_on_profile_key_collision(self):
+        conn = store.open_store(self.db)
+        conn.execute(
+            "INSERT INTO agent (id,name,profile_key) VALUES ('agent-existing','existing','taken')"
+        )
+        conn.close()
+        with self.assertRaises(SystemExit) as cm:
+            cli.main(['--db', self.db, 'agent', 'add', 'taken'])
+        self.assertIn('profile_key taken already belongs', str(cm.exception))
+        conn = store.open_store(self.db)
+        try:
+            self.assertIsNone(
+                conn.execute("SELECT 1 FROM agent WHERE id='agent-taken'").fetchone()
+            )
+        finally:
+            conn.close()
+
+    def test_agent_add_idempotent_only_for_same_identity(self):
+        cli.main(['--db', self.db, 'agent', 'add', 'same'])
+        cli.main(['--db', self.db, 'agent', 'add', 'same'])
+        conn = store.open_store(self.db)
+        try:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM agent WHERE id='agent-same'").fetchone()[0],
+                1
+            )
+        finally:
+            conn.close()
+
+    def test_cli_project_references_accept_exact_project_id(self):
+        project_id = '12345678-1234-5678-1234-567812345678'
+        conn = store.open_store(self.db)
+        conn.execute('INSERT INTO project (id,name) VALUES (?,?)', (project_id, 'uuid-demo'))
+        conn.close()
+        cli.main(['--db', self.db, 'agent', 'add', 'uuiduser'])
+        cli.main(['--db', self.db, 'member', 'add', project_id, 'uuiduser'])
+        cli.main([
+            '--db', self.db, 'remember', '--project', project_id,
+            '--agent', 'uuiduser', '--scope', 'project', 'uuid backed fact'
+        ])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cli.main([
+                '--db', self.db, 'search', '--project', project_id,
+                '--agent', 'uuiduser', 'uuid backed'
+            ])
+        self.assertIn('uuid backed fact', output.getvalue())
+
+    def test_project_add_rejects_duplicate_name_owned_by_other_id(self):
+        conn = store.open_store(self.db)
+        conn.execute("INSERT INTO project (id,name) VALUES ('uuid-existing','same-name')")
+        conn.close()
+        with self.assertRaises(SystemExit) as cm:
+            cli.main(['--db', self.db, 'project', 'add', 'same-name'])
+        self.assertIn('already belongs to uuid-existing', str(cm.exception))
+        conn = store.open_store(self.db)
+        try:
+            self.assertIsNone(
+                conn.execute("SELECT 1 FROM project WHERE id='proj-same-name'").fetchone()
+            )
+        finally:
+            conn.close()
+
+    def test_import_dry_run_rejects_agent_id_identity_collision(self):
+        conn = store.open_store(self.db)
+        conn.execute(
+            "INSERT INTO agent (id,name,profile_key) "
+            "VALUES ('agent-previewer','different','different')"
+        )
+        conn.close()
+        with self.assertRaises(SystemExit) as cm:
+            cli.main([
+                '--db', self.db, 'import', '--file', self.batch,
+                '--agent', 'previewer', '--project', 'demo', '--dry-run'
+            ])
+        self.assertIn('agent id agent-previewer has different identity', str(cm.exception))
+
     def test_member_add_missing_agent_is_clear_and_releases_store(self):
         with self.assertRaises(SystemExit) as cm:
             cli.main(['--db', self.db, 'member', 'add', 'demo', 'ghost'])
@@ -154,6 +231,56 @@ class CliImportTests(unittest.TestCase):
         os.replace(self.db, moved)
         os.replace(moved, self.db)
 
+    def test_cli_tombstone_override_requires_owner_and_audits(self):
+        conn = store.open_store(self.db)
+        for name, role in (( 'owner', 'owner'), ('member', 'member')):
+            aid = 'agent-' + name
+            conn.execute('INSERT INTO agent (id,name,profile_key) VALUES (?,?,?)', (aid,name,name))
+            conn.execute(
+                'INSERT INTO project_membership (project_id,agent_id,role) VALUES (?,?,?)',
+                ('proj-demo', aid, role)
+            )
+        mem_id, _ = core.create_memory(
+            conn, 'proj-demo', 'agent-owner', 'cli tombstone override claim', scope='project'
+        )
+        core.reject(conn, mem_id, 'agent-owner', 'wrong')
+        tomb_id = conn.execute('SELECT id FROM tombstone').fetchone()[0]
+        conn.close()
+        with self.assertRaises(SystemExit):
+            cli.main(['--db', self.db, 'tombstone', 'override', tomb_id, '--agent', 'member'])
+        cli.main(['--db', self.db, 'tombstone', 'override', tomb_id, '--agent', 'owner'])
+        conn = store.open_store(self.db)
+        try:
+            self.assertEqual(conn.execute(
+                'SELECT overridden_by FROM tombstone WHERE id=?', (tomb_id,)
+            ).fetchone()[0], 'agent-owner')
+            self.assertIsNotNone(conn.execute(
+                "SELECT 1 FROM audit_event WHERE action='tombstone_override' AND project_id='proj-demo'"
+            ).fetchone())
+        finally:
+            conn.close()
+
+    def test_mutation_cli_rejects_agent_identity_collision(self):
+        conn = store.open_store(self.db)
+        conn.execute("INSERT INTO agent (id,name,profile_key) VALUES ('agent-spoof','different','different')")
+        conn.execute("INSERT INTO agent (id,name,profile_key) VALUES ('agent-owner','owner','owner')")
+        conn.execute("INSERT INTO project_membership VALUES ('proj-demo','agent-spoof','member',datetime('now'))")
+        conn.execute("INSERT INTO project_membership VALUES ('proj-demo','agent-owner','owner',datetime('now'))")
+        mem_id, _ = core.create_memory(
+            conn, 'proj-demo', 'agent-owner', 'identity collision mutation target', scope='project'
+        )
+        conn.close()
+        with self.assertRaises(SystemExit) as cm:
+            cli.main(['--db', self.db, 'reject', mem_id, '--agent', 'spoof', 'should fail'])
+        self.assertIn('different identity', str(cm.exception))
+        conn = store.open_store(self.db)
+        try:
+            self.assertEqual(conn.execute(
+                'SELECT lifecycle FROM memory WHERE id=?', (mem_id,)
+            ).fetchone()[0], 'candidate')
+        finally:
+            conn.close()
+
     def test_doctor_detects_orphaned_idempotency_rows(self):
         conn = store.open_store(self.db)
         conn.execute(
@@ -166,6 +293,24 @@ class CliImportTests(unittest.TestCase):
             cli.main(['--db', self.db, 'doctor'])
         self.assertEqual(cm.exception.code, 1)
         self.assertIn('idempotency violations: 1', output.getvalue())
+
+    def test_doctor_detects_rejected_memory_without_active_guard(self):
+        conn = store.open_store(self.db)
+        conn.execute("INSERT INTO agent (id,name,profile_key) VALUES ('agent-a','a','a')")
+        conn.execute(
+            "INSERT INTO project_membership (project_id,agent_id,role) "
+            "VALUES ('proj-demo','agent-a','member')"
+        )
+        mem_id, _ = core.create_memory(
+            conn, 'proj-demo', 'agent-a', 'unguarded rejected claim', scope='project'
+        )
+        conn.execute("UPDATE memory SET lifecycle='rejected' WHERE id=?", (mem_id,))
+        conn.close()
+        output = io.StringIO()
+        with self.assertRaises(SystemExit) as cm, contextlib.redirect_stdout(output):
+            cli.main(['--db', self.db, 'doctor'])
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn(f"unguarded rejected memories: ['{mem_id}']", output.getvalue())
 
     def test_doctor_detects_crash_visible_migration_lock(self):
         conn = store.open_store(self.db)
@@ -217,6 +362,51 @@ class CliImportTests(unittest.TestCase):
                 os.environ['HERMES_HOME'] = old
         self.assertIn('default: OK', output.getvalue())
 
+    def test_doctor_accepts_exact_project_id_binding(self):
+        home = self._write_hermes_config('checker', project='uuid-project-123')
+        conn = store.open_store(self.db)
+        conn.execute("INSERT INTO project (id,name) VALUES ('uuid-project-123','renamed-project')")
+        conn.execute("INSERT INTO agent (id,name,profile_key) VALUES ('agent-checker','checker','checker')")
+        conn.execute(
+            "INSERT INTO project_membership (project_id,agent_id,role) "
+            "VALUES ('uuid-project-123','agent-checker','member')"
+        )
+        conn.close()
+        old = os.environ.get('HERMES_HOME')
+        os.environ['HERMES_HOME'] = home
+        output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(output):
+                cli.main(['--db', self.db, 'doctor'])
+        finally:
+            if old is None:
+                os.environ.pop('HERMES_HOME', None)
+            else:
+                os.environ['HERMES_HOME'] = old
+        self.assertIn('default: OK', output.getvalue())
+
+    def test_doctor_fails_closed_on_ambiguous_project_slug(self):
+        home = self._write_hermes_config('checker', project='same-slug')
+        conn = store.open_store(self.db)
+        conn.execute('DROP INDEX IF EXISTS idx_project_name_unique')
+        conn.execute("INSERT INTO project (id,name) VALUES ('project-a','same-slug')")
+        conn.execute("INSERT INTO project (id,name) VALUES ('project-b','same-slug')")
+        conn.execute("INSERT INTO agent (id,name,profile_key) VALUES ('agent-checker','checker','checker')")
+        conn.close()
+        old = os.environ.get('HERMES_HOME')
+        os.environ['HERMES_HOME'] = home
+        output = io.StringIO()
+        try:
+            with self.assertRaises(SystemExit) as cm, contextlib.redirect_stdout(output):
+                cli.main(['--db', self.db, 'doctor'])
+            self.assertEqual(cm.exception.code, 1)
+        finally:
+            if old is None:
+                os.environ.pop('HERMES_HOME', None)
+            else:
+                os.environ['HERMES_HOME'] = old
+        self.assertIn('ambiguous_project:same-slug', output.getvalue())
+
     def test_doctor_detects_enabled_profile_membership_drift(self):
         home = self._write_hermes_config('missing-agent')
         old = os.environ.get('HERMES_HOME')
@@ -232,6 +422,34 @@ class CliImportTests(unittest.TestCase):
             else:
                 os.environ['HERMES_HOME'] = old
         self.assertIn('missing_membership:missing-agent->demo', output.getvalue())
+
+    def test_doctor_detects_duplicate_project_names_even_without_active_binding(self):
+        conn = store.open_store(self.db)
+        conn.execute('DROP INDEX IF EXISTS idx_project_name_unique')
+        conn.execute("INSERT INTO project (id,name) VALUES ('project-a','duplicate-name')")
+        conn.execute("INSERT INTO project (id,name) VALUES ('project-b','duplicate-name')")
+        conn.close()
+        output = io.StringIO()
+        with self.assertRaises(SystemExit) as cm, contextlib.redirect_stdout(output):
+            cli.main(['--db', self.db, 'doctor'])
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn('project name collisions:', output.getvalue())
+        self.assertIn('duplicate-name', output.getvalue())
+
+    def test_doctor_detects_invalid_tombstone_scope_or_fingerprint(self):
+        conn = store.open_store(self.db)
+        conn.execute(
+            "INSERT INTO tombstone (id,claim_fingerprint,scope,reason) "
+            "VALUES ('t-bad','NOT-A-FINGERPRINT','private:missing-project:missing-agent','bad')"
+        )
+        conn.close()
+        output = io.StringIO()
+        with self.assertRaises(SystemExit) as cm, contextlib.redirect_stdout(output):
+            cli.main(['--db', self.db, 'doctor'])
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn('tombstone violations:', output.getvalue())
+        self.assertIn('invalid_fingerprint', output.getvalue())
+        self.assertIn('invalid_private_scope', output.getvalue())
 
     def test_doctor_detects_agent_name_collision(self):
         home = self._write_hermes_config('checker')

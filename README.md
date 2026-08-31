@@ -10,7 +10,7 @@ uses the Python standard library for the core engine.
 - Phase 1 core correctness: implemented and covered by the integration harness.
 - Phase 2 Hermes plugin: installed separately under the user plugin directory.
 - Phase 3+ lifecycle/source-aware features: incremental; see the planning repo.
-- Schema contract remains frozen; revisions are applied through migrations.
+- Schema contract remains frozen; revisions are applied through migrations. Current schema revision: `0007_integrity_hardening`.
 
 ## Repository layout
 
@@ -31,6 +31,7 @@ cd C:\Users\BlankScreen\Workspace\memcore
 python -m unittest discover -v
 ```
 
+Current full core gate: 148 tests pass, with the E12 token-budget pair remaining expected failures.
 The E12 token-budget pair remains an expected failure in the core harness
 because prompt-size enforcement lives in the Hermes plugin's recall builder.
 The plugin has its own budget regression tests.
@@ -42,11 +43,14 @@ python -m memcore doctor
 python -m memcore stats
 python -m memcore gc
 python -m memcore gc --apply
+python -m memcore tombstone override <tombstone_id> --agent pchoke
 python -m memcore import --file batch.json --agent mika --project shared-platform --dry-run
 python -m memcore import --file batch.json --agent mika --project shared-platform
 ```
 
-`gc` is dry-run by default. `import --dry-run` validates the batch, reports
+`gc` is dry-run by default. Age-based GC disables old unevidenced candidates reversibly; it never age-rejects or creates tombstones. Active tombstones persist until explicit override; only old overridden tombstones are purgeable.
+
+`import --dry-run` validates the batch, reports
 within-batch duplicates / prior imports / tombstone blocks, and performs zero
 domain writes (no agent, membership, memory, or audit rows). Imported memories
 enter as candidates. Real import is idempotent per project + content fingerprint,
@@ -57,5 +61,6 @@ and each memory plus all evidence links commits atomically as one item.
 - Project membership is required at read and write boundaries.
 - Private memory is writable only by its owner or a project owner.
 - Plugin-bound mutations cannot target another project by memory ID.
-- Rejected claims create tombstones that block silent resurrection.
+- Rejected/corrected claims create scope-aware tombstones that block silent resurrection; explicit override is owner-audited and does not resurrect the old rejected row.
+- Search ranking is deterministic and exposes lifecycle, verification, and freshness rather than treating candidate memory as verified fact.
 - Search returns only the current memory version; history remains queryable.

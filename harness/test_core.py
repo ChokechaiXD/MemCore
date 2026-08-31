@@ -1,5 +1,5 @@
 """
-MemCore engine unit tests — Phase 1.
+MemCore engine unit tests ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â Phase 1.
 
 Tests the real core operations the harness evaluations don't cover:
 idempotency replay, promote permissions, deactivate/restore, search ranking,
@@ -170,6 +170,23 @@ class TestStore(CoreTestBase):
             store.open_store_readonly(missing)
         self.assertFalse(os.path.exists(missing))
 
+    def test_integrity_migration_enforces_unique_project_names(self):
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(
+                "INSERT INTO project (id,name) VALUES ('proj-duplicate-alpha','alpha')"
+            )
+
+    def test_integrity_migration_aborts_malformed_version_timestamp(self):
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(
+                "INSERT INTO memory_version "
+                "(id,memory_id,content,created_by_agent_id,created_at) "
+                "VALUES ('ver-bad-ts','mem-does-not-matter','bad timestamp','agent-alice','not-a-time')"
+            )
+        self.assertIsNone(self.conn.execute(
+            "SELECT 1 FROM memory_version WHERE id='ver-bad-ts'"
+        ).fetchone())
+
     def test_unknown_future_schema_version_fails_closed(self):
         self.conn.execute(
             "INSERT INTO schema_migrations (version, applied_at) "
@@ -204,7 +221,7 @@ class TestStore(CoreTestBase):
             except OSError:
                 pass
         real = store.MIGRATIONS
-        store.MIGRATIONS = real[:3]  # simulate the old engine (0001–0003 only)
+        store.MIGRATIONS = real[:3]  # simulate the old engine (0001ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ0003 only)
         try:
             old = store.open_store(self.db_path)
             old.execute("INSERT INTO project (id, name) VALUES ('proj-old', 'Legacy')")
@@ -242,6 +259,31 @@ class TestStore(CoreTestBase):
         ).fetchall()
         self.assertEqual(len(hits), 1)
         conn.close()
+
+    def test_failed_fresh_bootstrap_rolls_back_schema_and_bookkeeping(self):
+        self.conn.close()
+        bad_schema = os.path.join(self.tmpdir, 'bad_schema.sql')
+        with open(bad_schema, 'w', encoding='utf-8') as f:
+            f.write('CREATE TABLE bootstrap_partial (id INTEGER);\n'
+                    'INSERT INTO definitely_missing_table VALUES (1);\n')
+        fresh = os.path.join(self.tmpdir, 'fresh_fail.db')
+        raw = sqlite3.connect(fresh, isolation_level=None)
+        raw.execute('CREATE TABLE schema_migrations ('
+                    'version TEXT PRIMARY KEY, applied_at TEXT, lock_holder TEXT, lock_until REAL)')
+        original_schema = store.SCHEMA_PATH
+        store.SCHEMA_PATH = original_schema.__class__(bad_schema)
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                store._apply_migration(raw, '0001_initial_contract', None)
+        finally:
+            store.SCHEMA_PATH = original_schema
+        self.assertIsNone(raw.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bootstrap_partial'"
+        ).fetchone())
+        self.assertIsNone(raw.execute(
+            "SELECT 1 FROM schema_migrations WHERE version='0001_initial_contract'"
+        ).fetchone())
+        raw.close()
 
     def test_failed_migration_rolls_back_schema_and_bookkeeping(self):
         """A failed future migration leaves neither DDL nor migration record."""
@@ -287,6 +329,28 @@ class TestCreateMemory(CoreTestBase):
         self.assertEqual(row[1], 'candidate')
         self.assertEqual(row[2], self.alice)
 
+    def test_engine_owned_create_timestamps_are_iso_z(self):
+        mem_id, ver_id = core.create_memory(
+            self.conn, self.project, self.alice, 'timestamp contract claim',
+            scope='project', idempotency_key='timestamp-contract-key'
+        )
+        mem = self.conn.execute(
+            'SELECT created_at,updated_at FROM memory WHERE id=?', (mem_id,)
+        ).fetchone()
+        ver = self.conn.execute(
+            'SELECT created_at,valid_from FROM memory_version WHERE id=?', (ver_id,)
+        ).fetchone()
+        audit = self.conn.execute(
+            "SELECT created_at FROM audit_event WHERE memory_id=? AND action='create'", (mem_id,)
+        ).fetchone()[0]
+        idem = self.conn.execute(
+            'SELECT created_at FROM idempotency_key WHERE key=?', ('timestamp-contract-key',)
+        ).fetchone()[0]
+        for value in (*mem, *ver, audit, idem):
+            self.assertTrue(value.endswith('Z'), value)
+        self.assertEqual(mem[0], mem[1])
+        self.assertEqual(ver[0], ver[1])
+
     def test_create_project_memory_requires_membership(self):
         self.conn.execute(
             "INSERT INTO agent (id, name, profile_key) VALUES ('agent-mallory', 'mallory', 'mallory')"
@@ -308,6 +372,19 @@ class TestCreateMemory(CoreTestBase):
                 self.conn, self.project, 'agent-mallory', 'private bypass attempt',
                 scope='private'
             )
+
+    def test_create_rejects_empty_content_and_terminal_initial_lifecycle(self):
+        for bad_content in ('', '   ', None):
+            with self.subTest(content=bad_content), self.assertRaises(core.MemCoreError):
+                core.create_memory(
+                    self.conn, self.project, self.alice, bad_content, scope='project'
+                )
+        for terminal in ('rejected', 'disabled', 'superseded'):
+            with self.subTest(lifecycle=terminal), self.assertRaises(core.MemCoreError):
+                core.create_memory(
+                    self.conn, self.project, self.alice, 'terminal direct create',
+                    scope='project', lifecycle=terminal
+                )
 
     def test_idempotency_key_replays_same_ids(self):
         r1 = core.create_memory(
@@ -367,6 +444,38 @@ class TestCreateMemory(CoreTestBase):
                 scope='project', idempotency_key='reject-key'
             )
 
+    def test_disabled_idempotent_replay_does_not_return_stale_success(self):
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, 'later disabled idempotent claim',
+            scope='project', idempotency_key='disabled-key'
+        )
+        core.deactivate(self.conn, mem_id, self.alice, reason='operator disabled')
+        with self.assertRaises(core.MemCoreError):
+            core.create_memory(
+                self.conn, self.project, self.alice, 'later disabled idempotent claim',
+                scope='project', idempotency_key='disabled-key'
+            )
+        self.assertEqual(
+            self.conn.execute(
+                'SELECT lifecycle FROM memory WHERE id=?', (mem_id,)
+            ).fetchone()[0],
+            'disabled'
+        )
+
+    def test_corrected_idempotent_replay_honors_old_claim_tombstone(self):
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, 'old idempotent claim',
+            scope='project', idempotency_key='corrected-key'
+        )
+        core.supersede(
+            self.conn, mem_id, self.alice, 'new corrected claim', reason='fix old claim'
+        )
+        with self.assertRaises(core.TombstoneBlocked):
+            core.create_memory(
+                self.conn, self.project, self.alice, 'old idempotent claim',
+                scope='project', idempotency_key='corrected-key'
+            )
+
     def test_nonmember_cannot_probe_tombstone_state(self):
         claim = 'private project rejected fact'
         mem_id, _ = core.create_memory(
@@ -381,9 +490,41 @@ class TestCreateMemory(CoreTestBase):
                 self.conn, self.project, 'agent-mallory', claim, scope='project'
             )
 
+    def test_private_rejection_is_owner_scoped_and_does_not_block_project(self):
+        claim = 'alice private rejected observation'
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, claim, scope='private'
+        )
+        core.reject(self.conn, mem_id, self.alice, 'private correction')
+        scope = self.conn.execute(
+            'SELECT scope FROM tombstone WHERE claim_fingerprint=?',
+            (core.fingerprint(claim),)
+        ).fetchone()[0]
+        self.assertEqual(scope, core._private_tombstone_scope(self.project, self.alice))
+        with self.assertRaises(core.TombstoneBlocked):
+            core.create_memory(
+                self.conn, self.project, self.alice, claim, scope='private'
+            )
+        # A private refusal must neither leak into nor block another member's lane.
+        core.create_memory(self.conn, self.project, self.bob, claim, scope='private')
+        core.create_memory(self.conn, self.project, self.bob, claim, scope='project')
+
+    def test_project_rejection_blocks_private_recapture_in_same_project(self):
+        claim = 'project-wide known bad claim'
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, claim, scope='project'
+        )
+        core.reject(self.conn, mem_id, self.alice, 'project rejection')
+        with self.assertRaises(core.TombstoneBlocked):
+            core.create_memory(
+                self.conn, self.project, self.bob, claim, scope='private'
+            )
+
     def test_tombstone_blocks_identical_claim(self):
         claim = 'Alpha uses PostgreSQL for storage.'
-        core.create_memory(self.conn, self.project, self.alice, claim)
+        core.create_memory(
+            self.conn, self.project, self.alice, claim, scope='project'
+        )
         mem_id = self.conn.execute(
             'SELECT id FROM memory ORDER BY created_at DESC LIMIT 1'
         ).fetchone()[0]
@@ -395,7 +536,9 @@ class TestCreateMemory(CoreTestBase):
 
     def test_tombstone_blocks_whitespace_case_variant(self):
         claim = 'Alpha uses PostgreSQL for storage.'
-        core.create_memory(self.conn, self.project, self.alice, claim)
+        core.create_memory(
+            self.conn, self.project, self.alice, claim, scope='project'
+        )
         mem_id = self.conn.execute(
             'SELECT id FROM memory ORDER BY created_at DESC LIMIT 1'
         ).fetchone()[0]
@@ -478,6 +621,207 @@ class TestSupersedeAndDeactivate(CoreTestBase):
         versions = core.superseded_history(self.conn, mem_id, self.alice)
         self.assertEqual(len(versions), 2)
         self.assertEqual(versions[0][0], v1)
+
+    def test_supersede_resets_trust_and_closes_temporal_interval(self):
+        mem_id, old_ver = core.create_memory(
+            self.conn, self.project, self.alice, 'verified old claim', scope='project'
+        )
+        self.conn.execute(
+            "UPDATE memory SET lifecycle='accepted', verification='source_backed', "
+            "freshness='stale' WHERE id=?", (mem_id,)
+        )
+        ev_id = core._new_id('ev')
+        self.conn.execute(
+            "INSERT INTO evidence (id,kind,source_uri) VALUES (?, 'file', 'file:///old')",
+            (ev_id,)
+        )
+        self.conn.execute(
+            "INSERT INTO evidence_link (evidence_id,memory_version_id,relation) "
+            "VALUES (?,?,'supports')", (ev_id, old_ver)
+        )
+        new_ver = core.supersede(
+            self.conn, mem_id, self.alice, 'new unverified claim', reason='correction'
+        )
+        lifecycle, verification, freshness = self.conn.execute(
+            'SELECT lifecycle,verification,freshness FROM memory WHERE id=?', (mem_id,)
+        ).fetchone()
+        self.assertEqual((lifecycle, verification, freshness),
+                         ('candidate', 'unverified', 'current'))
+        old_until = self.conn.execute(
+            'SELECT valid_until FROM memory_version WHERE id=?', (old_ver,)
+        ).fetchone()[0]
+        new_from = self.conn.execute(
+            'SELECT valid_from FROM memory_version WHERE id=?', (new_ver,)
+        ).fetchone()[0]
+        self.assertIsNotNone(old_until)
+        self.assertEqual(old_until, new_from)
+        self.assertEqual(
+            self.conn.execute(
+                'SELECT COUNT(*) FROM evidence_link WHERE memory_version_id=?', (new_ver,)
+            ).fetchone()[0],
+            0
+        )
+
+    def test_supersede_tombstones_old_claim_against_resurrection(self):
+        old_content = 'REST endpoint is /v1/old'
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, old_content, scope='project'
+        )
+        core.supersede(
+            self.conn, mem_id, self.alice, 'REST endpoint is /v2/new', reason='API correction'
+        )
+        fp = core.fingerprint(old_content)
+        self.assertIsNotNone(
+            self.conn.execute(
+                'SELECT 1 FROM tombstone WHERE claim_fingerprint=? AND scope=? '
+                'AND overridden_by IS NULL', (fp, self.project)
+            ).fetchone()
+        )
+        with self.assertRaises(core.TombstoneBlocked):
+            core.create_memory(
+                self.conn, self.project, self.alice, old_content, scope='project'
+            )
+
+    def test_terminal_memories_cannot_be_superseded(self):
+        for terminal in ('disabled', 'rejected'):
+            with self.subTest(terminal=terminal):
+                content = f'terminal correction guard {terminal}'
+                mem_id, _ = core.create_memory(
+                    self.conn, self.project, self.alice, content, scope='project'
+                )
+                if terminal == 'disabled':
+                    core.deactivate(self.conn, mem_id, self.alice)
+                else:
+                    core.reject(self.conn, mem_id, self.alice, 'wrong')
+                with self.assertRaises(core.MemCoreError):
+                    core.supersede(self.conn, mem_id, self.alice, 'should not reactivate')
+
+    def test_supersede_rejects_equivalent_claim_without_changing_trust(self):
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, 'Same Claim',
+            scope='project', lifecycle='accepted'
+        )
+        before_versions = self.conn.execute(
+            'SELECT COUNT(*) FROM memory_version WHERE memory_id=?', (mem_id,)
+        ).fetchone()[0]
+        with self.assertRaises(core.MemCoreError):
+            core.supersede(self.conn, mem_id, self.alice, '  same   claim  ')
+        lifecycle = self.conn.execute(
+            'SELECT lifecycle FROM memory WHERE id=?', (mem_id,)
+        ).fetchone()[0]
+        after_versions = self.conn.execute(
+            'SELECT COUNT(*) FROM memory_version WHERE memory_id=?', (mem_id,)
+        ).fetchone()[0]
+        self.assertEqual(lifecycle, 'accepted')
+        self.assertEqual(after_versions, before_versions)
+
+    def test_reject_cannot_create_unguarded_rejected_state(self):
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, 'must stay guarded', scope='project'
+        )
+        with self.assertRaises(core.MemCoreError):
+            core.reject(self.conn, mem_id, self.alice, 'wrong', create_tombstone=False)
+        self.assertEqual(
+            self.conn.execute('SELECT lifecycle FROM memory WHERE id=?', (mem_id,)).fetchone()[0],
+            'candidate'
+        )
+
+    def test_project_tombstone_override_requires_owner_and_reopens_admission(self):
+        content = 'project guard override claim'
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, content, scope='project'
+        )
+        core.reject(self.conn, mem_id, self.alice, 'wrong project claim')
+        tomb_id = self.conn.execute(
+            'SELECT id FROM tombstone WHERE claim_fingerprint=?',
+            (core.fingerprint(content),)
+        ).fetchone()[0]
+        with self.assertRaises(core.PermissionDenied):
+            core.override_tombstone(self.conn, tomb_id, self.bob)
+        self.assertTrue(core.override_tombstone(self.conn, tomb_id, self.alice))
+        self.assertFalse(core.override_tombstone(self.conn, tomb_id, self.alice))
+        self.assertTrue(core.admission_allowed(
+            self.conn, content, self.project, scope='project', agent_id=self.alice
+        ))
+        self.assertEqual(
+            self.conn.execute('SELECT lifecycle FROM memory WHERE id=?', (mem_id,)).fetchone()[0],
+            'rejected'
+        )
+        audit = self.conn.execute(
+            "SELECT action FROM audit_event WHERE action='tombstone_override' "
+            'AND project_id=?', (self.project,)
+        ).fetchone()
+        self.assertIsNotNone(audit)
+
+    def test_private_tombstone_override_is_owner_scoped(self):
+        content = 'alice private guard override claim'
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, content, scope='private'
+        )
+        core.reject(self.conn, mem_id, self.alice, 'private wrong')
+        tomb_id = self.conn.execute(
+            'SELECT id FROM tombstone WHERE claim_fingerprint=?',
+            (core.fingerprint(content),)
+        ).fetchone()[0]
+        with self.assertRaises(core.PermissionDenied):
+            core.override_tombstone(self.conn, tomb_id, self.bob)
+        self.assertTrue(core.override_tombstone(self.conn, tomb_id, self.alice))
+        self.assertTrue(core.admission_allowed(
+            self.conn, content, self.project, scope='private', agent_id=self.alice
+        ))
+
+    def test_global_tombstone_override_fails_closed_without_admin_model(self):
+        tomb_id = 'tomb-global-override-test'
+        self.conn.execute(
+            "INSERT INTO tombstone (id,claim_fingerprint,scope,reason) "
+            "VALUES (?,? ,'global','global bad claim')",
+            (tomb_id, core.fingerprint('global bad claim'))
+        )
+        with self.assertRaises(core.PermissionDenied):
+            core.override_tombstone(self.conn, tomb_id, self.alice)
+
+    def test_reject_repairs_missing_tombstone_on_legacy_rejected_memory(self):
+        content = 'legacy rejected row missing its guard'
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, content, scope='project'
+        )
+        self.conn.execute(
+            "UPDATE memory SET lifecycle='rejected' WHERE id=?", (mem_id,)
+        )
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM tombstone').fetchone()[0], 0)
+        self.assertFalse(core.reject(self.conn, mem_id, self.alice, 'repair guard'))
+        self.assertEqual(
+            self.conn.execute(
+                'SELECT COUNT(*) FROM tombstone WHERE claim_fingerprint=? AND scope=?',
+                (core.fingerprint(content), self.project)
+            ).fetchone()[0],
+            1
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT action FROM audit_event WHERE memory_id=? ORDER BY id DESC LIMIT 1",
+                (mem_id,)
+            ).fetchone()[0],
+            'reject_tombstone_repair'
+        )
+
+    def test_nonmember_mutation_does_not_reveal_memory_existence(self):
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, 'cross project existence secret', scope='private'
+        )
+        self.conn.execute(
+            "INSERT INTO agent (id,name,profile_key) VALUES ('agent-mallory','mallory','mallory')"
+        )
+        for target in (mem_id, 'mem-definitely-missing'):
+            with self.subTest(target=target), self.assertRaises(core.PermissionDenied):
+                core._require_memory_write_access(self.conn, target, 'agent-mallory')
+            with self.subTest(promote=target), self.assertRaises(core.PermissionDenied):
+                core.promote(self.conn, target, 'agent-mallory')
+            with self.subTest(supersede_wrapper=target), self.assertRaises(core.PermissionDenied):
+                core.supersede_memory(
+                    self.conn, target, 'agent-mallory', 'rewrite',
+                    new_project_id=self.project
+                )
 
     def test_private_history_does_not_leak_to_other_member(self):
         mem_id, _ = core.create_memory(
@@ -667,11 +1011,11 @@ class TestSearch(CoreTestBase):
     def test_search_supports_unicode_thai_query(self):
         core.create_memory(
             self.conn, self.project, self.alice,
-            'ระบบความจำร่วมสำหรับเอเจนต์', scope='project'
+            'ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â°ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¾ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â²ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂªÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â«ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â­ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢', scope='project'
         )
-        hits = core.search(self.conn, self.project, self.bob, 'ระบบความจำร่วม')
+        hits = core.search(self.conn, self.project, self.bob, 'ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â°ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¾ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â²ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡')
         self.assertEqual(len(hits), 1)
-        self.assertIn('ระบบความจำร่วม', hits[0][5])
+        self.assertIn('ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â°ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¾ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â²ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡', hits[0][5])
 
     def test_search_survives_fts_operators_in_query(self):
         """Regression: raw user strings with FTS5 operator chars must not raise.
@@ -683,7 +1027,7 @@ class TestSearch(CoreTestBase):
             self.conn, self.project, self.alice,
             "bob's CLI taste is questionable", scope='project'
         )
-        # apostrophe, quotes, parens, hyphen — all previously fatal
+        # apostrophe, quotes, parens, hyphen ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â all previously fatal
         hits = core.search(self.conn, self.project, self.bob, "bob's CLI taste")
         contents = [r[5] for r in hits]
         self.assertEqual(len(contents), 1)
@@ -700,7 +1044,7 @@ class TestSearch(CoreTestBase):
         )
         rows = core.search(self.conn, self.project, self.alice, 'deploy')
         contents = [r[5] for r in rows if r[0] == mem_id]
-        # current truth only — superseded content must not surface in retrieval
+        # current truth only ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â superseded content must not surface in retrieval
         self.assertEqual(contents, ['new claim about deploy'])
 
     def test_rank_prefers_pinned(self):
@@ -717,8 +1061,35 @@ class TestSearch(CoreTestBase):
         hits = core.search(self.conn, self.project, self.alice, 'kubernetes deployment')
         self.assertEqual(hits[0][0], mem_b, 'pinned memory must rank first')
 
+    def test_search_rank_prefers_trusted_current_memory_on_equal_text(self):
+        rows = []
+        for lifecycle, verification, freshness in [
+            ('candidate','unverified','current'),
+            ('accepted','unverified','stale'),
+            ('accepted','source_backed','current'),
+            ('accepted','user_authoritative','current'),
+        ]:
+            mem_id, _ = core.create_memory(
+                self.conn, self.project, self.alice,
+                'equal ranking phrase for trust ordering', scope='project', lifecycle=lifecycle
+            )
+            self.conn.execute(
+                'UPDATE memory SET verification=?, freshness=? WHERE id=?',
+                (verification, freshness, mem_id)
+            )
+            rows.append((mem_id, lifecycle, verification, freshness))
+        hits = core.search(self.conn, self.project, self.alice, 'equal ranking phrase')
+        self.assertEqual(hits[0][0], rows[3][0])
+        self.assertEqual(hits[1][0], rows[2][0])
+        self.assertEqual(hits[-1][0], rows[0][0])
 
-# ── operational tooling tests ──────────────────────────────────────────
+    def test_search_rejects_nonpositive_or_invalid_limits(self):
+        for bad in (-1, 0, 'nope'):
+            with self.subTest(limit=bad), self.assertRaises(core.MemCoreError):
+                core.search(self.conn, self.project, self.alice, 'anything', limit=bad)
+
+
+# ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ operational tooling tests ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬
 
 class TestGC(CoreTestBase):
     """Tests for gc_scan (dry-run) and gc_apply (retention sweep)."""
@@ -728,9 +1099,9 @@ class TestGC(CoreTestBase):
         mem_id, ver_id = core.create_memory(
             self.conn, self.project, self.alice, 'old claim with no evidence', scope='project'
         )
-        # Backdate the memory's created_at beyond the candidate-days cutoff.
+        # Backdate last activity beyond the candidate-days cutoff.
         self.conn.execute(
-            "UPDATE memory SET created_at=datetime('now', '-40 days') WHERE id=?",
+            "UPDATE memory SET updated_at=datetime('now', '-40 days') WHERE id=?",
             (mem_id,)
         )
         self.conn.commit()
@@ -745,7 +1116,7 @@ class TestGC(CoreTestBase):
             self.conn, self.project, self.alice, 'evidenced claim', scope='project'
         )
         self.conn.execute(
-            "UPDATE memory SET created_at=datetime('now', '-40 days') WHERE id=?",
+            "UPDATE memory SET updated_at=datetime('now', '-40 days') WHERE id=?",
             (mem_id,)
         )
         ev_id = core._new_id('ev')
@@ -761,6 +1132,38 @@ class TestGC(CoreTestBase):
         candidates, tombstones = core.gc_scan(self.conn, candidate_days=30, tombstone_days=90)
         self.assertEqual(len(candidates), 0)
         self.assertEqual(len(tombstones), 0)
+
+    def test_gc_uses_current_version_evidence_only(self):
+        mem_id, old_ver = core.create_memory(
+            self.conn, self.project, self.alice, 'evidenced old claim', scope='project'
+        )
+        ev_id = core._new_id('ev')
+        self.conn.execute(
+            'INSERT INTO evidence (id,kind,source_uri,source_label) VALUES (?,?,?,?)',
+            (ev_id, 'test', 'test://old-version', 'old version evidence')
+        )
+        self.conn.execute(
+            "INSERT INTO evidence_link (evidence_id,memory_version_id,relation) "
+            "VALUES (?,?,'supports')", (ev_id, old_ver)
+        )
+        core.supersede(
+            self.conn, mem_id, self.alice, 'replacement claim without evidence',
+            reason='claim changed'
+        )
+        self.conn.execute(
+            "UPDATE memory SET updated_at=datetime('now','-40 days') WHERE id=?",
+            (mem_id,)
+        )
+        candidates, _ = core.gc_scan(self.conn, candidate_days=30)
+        self.assertIn(mem_id, [row[0] for row in candidates])
+        disabled, _ = core.gc_apply(self.conn, candidate_days=30)
+        self.assertIn(mem_id, disabled)
+        self.assertEqual(
+            self.conn.execute(
+                'SELECT lifecycle FROM memory WHERE id=?', (mem_id,)
+            ).fetchone()[0],
+            'disabled'
+        )
 
     def test_gc_scan_finds_old_overridden_tombstones(self):
         """Only old overridden tombstones are gc candidates for purging."""
@@ -781,7 +1184,7 @@ class TestGC(CoreTestBase):
         self.assertEqual(tombstones[0][0], tomb_id)
 
     def test_gc_scan_does_not_touch_anything(self):
-        """gc_scan is a pure read — no data should change."""
+        """gc_scan is a pure read ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â no data should change."""
         mem_id, _ = core.create_memory(
             self.conn, self.project, self.alice, 'young candidate', scope='project'
         )
@@ -794,29 +1197,31 @@ class TestGC(CoreTestBase):
         ).fetchone()[0]
         self.assertEqual(lc, 'candidate')
 
-    def test_gc_apply_tombstones_old_candidates(self):
-        """gc_apply tombstones eligible candidates with reason 'gc'."""
-        mem_id, ver_id = core.create_memory(
+    def test_gc_apply_disables_old_candidates_without_tombstone(self):
+        """Age-based retention is reversible and does not declare a claim false."""
+        mem_id, _ = core.create_memory(
             self.conn, self.project, self.alice, 'gc me', scope='project'
         )
         self.conn.execute(
-            "UPDATE memory SET created_at=datetime('now', '-40 days') WHERE id=?",
+            "UPDATE memory SET updated_at=datetime('now', '-40 days') WHERE id=?",
             (mem_id,)
         )
         self.conn.commit()
-        tombstoned, purged = core.gc_apply(self.conn, candidate_days=30, tombstone_days=90)
-        self.assertEqual(len(tombstoned), 1)
-        self.assertEqual(tombstoned[0], mem_id)
-        self.assertEqual(len(purged), 0)
-        lc = self.conn.execute(
+        disabled, purged = core.gc_apply(self.conn, candidate_days=30, tombstone_days=90)
+        self.assertEqual(disabled, [mem_id])
+        self.assertEqual(purged, [])
+        lifecycle = self.conn.execute(
             'SELECT lifecycle FROM memory WHERE id=?', (mem_id,)
         ).fetchone()[0]
-        self.assertEqual(lc, 'rejected')
-        reason = self.conn.execute(
-            'SELECT reason FROM tombstone WHERE claim_fingerprint=?',
-            (core.fingerprint('gc me'),)
-        ).fetchone()[0]
-        self.assertEqual(reason, 'gc')
+        self.assertEqual(lifecycle, 'disabled')
+        self.assertEqual(
+            self.conn.execute(
+                'SELECT COUNT(*) FROM tombstone WHERE claim_fingerprint=?',
+                (core.fingerprint('gc me'),)
+            ).fetchone()[0],
+            0
+        )
+        self.assertTrue(core.admission_allowed(self.conn, 'gc me', self.project))
 
     def test_gc_apply_purges_old_overridden_tombstones(self):
         """gc_apply removes only overridden tombstones past the cutoff."""
@@ -889,7 +1294,7 @@ class TestGC(CoreTestBase):
             self.conn, self.project, self.alice, 'iso timestamp gc candidate', scope='project'
         )
         self.conn.execute(
-            "UPDATE memory SET created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-40 days') "
+            "UPDATE memory SET updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-40 days') "
             'WHERE id=?', (mem_id,)
         )
         candidates, _ = core.gc_scan(self.conn, candidate_days=30)
@@ -900,7 +1305,7 @@ class TestGC(CoreTestBase):
             self.conn, self.project, self.alice, 'race protected candidate', scope='project'
         )
         self.conn.execute(
-            "UPDATE memory SET created_at=datetime('now','-40 days') WHERE id=?", (mem_id,)
+            "UPDATE memory SET updated_at=datetime('now','-40 days') WHERE id=?", (mem_id,)
         )
         stale = core.gc_scan(self.conn, candidate_days=30, tombstone_days=90)
         ev_id = core._new_id('ev')
@@ -919,6 +1324,50 @@ class TestGC(CoreTestBase):
         finally:
             core.gc_scan = original
         self.assertNotIn(mem_id, tombstoned)
+        lifecycle = self.conn.execute(
+            'SELECT lifecycle FROM memory WHERE id=?', (mem_id,)
+        ).fetchone()[0]
+        self.assertEqual(lifecycle, 'candidate')
+
+    def test_gc_skips_pinned_and_critical_candidates(self):
+        pinned, _ = core.create_memory(
+            self.conn, self.project, self.alice, 'pinned retention guard', scope='project'
+        )
+        critical, _ = core.create_memory(
+            self.conn, self.project, self.alice, 'critical retention guard', scope='project'
+        )
+        self.conn.execute(
+            "UPDATE memory SET pinned=1, updated_at=datetime('now','-100 days') WHERE id=?",
+            (pinned,)
+        )
+        self.conn.execute(
+            "UPDATE memory SET critical=1, updated_at=datetime('now','-100 days') WHERE id=?",
+            (critical,)
+        )
+        candidates, _ = core.gc_scan(self.conn, candidate_days=30)
+        ids = {row[0] for row in candidates}
+        self.assertNotIn(pinned, ids)
+        self.assertNotIn(critical, ids)
+        disabled, _ = core.gc_apply(self.conn, candidate_days=30)
+        self.assertNotIn(pinned, disabled)
+        self.assertNotIn(critical, disabled)
+
+    def test_recent_correction_of_old_memory_is_not_immediately_gc_eligible(self):
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, 'old claim before correction', scope='project'
+        )
+        self.conn.execute(
+            "UPDATE memory SET created_at=datetime('now','-200 days'), "
+            "updated_at=datetime('now','-200 days') WHERE id=?",
+            (mem_id,)
+        )
+        core.supersede(
+            self.conn, mem_id, self.alice, 'freshly corrected claim', reason='recent correction'
+        )
+        candidates, _ = core.gc_scan(self.conn, candidate_days=30)
+        self.assertNotIn(mem_id, [row[0] for row in candidates])
+        disabled, _ = core.gc_apply(self.conn, candidate_days=30)
+        self.assertNotIn(mem_id, disabled)
         lifecycle = self.conn.execute(
             'SELECT lifecycle FROM memory WHERE id=?', (mem_id,)
         ).fetchone()[0]
@@ -1019,6 +1468,10 @@ class TestImport(CoreTestBase):
             'SELECT kind FROM evidence WHERE id=?', (links[0][0],)
         ).fetchone()[0]
         self.assertEqual(ev, 'file')
+        ev_ts = self.conn.execute('SELECT captured_at FROM evidence WHERE id=?', (links[0][0],)).fetchone()[0]
+        link_ts = self.conn.execute('SELECT created_at FROM evidence_link WHERE evidence_id=? AND memory_version_id=?', (links[0][0], ver_id)).fetchone()[0]
+        self.assertTrue(ev_ts.endswith('Z'), ev_ts)
+        self.assertTrue(link_ts.endswith('Z'), link_ts)
 
     def test_import_rolls_back_memory_if_evidence_insert_fails(self):
         self.conn.execute(
@@ -1120,6 +1573,46 @@ class TestImport(CoreTestBase):
         ).fetchall()
         self.assertEqual([row[0] for row in scopes], ['private', 'project'])
 
+    def test_private_import_idempotency_is_scoped_per_agent_and_not_project(self):
+        content = 'same import claim across independent visibility lanes'
+        items = [{'summary': content, 'type': 'fact'}]
+        first = core.import_memories(
+            self.conn, items, self.project, self.alice, scope='private'
+        )
+        second = core.import_memories(
+            self.conn, items, self.project, self.bob, scope='private'
+        )
+        shared = core.import_memories(
+            self.conn, items, self.project, self.alice, scope='project'
+        )
+        self.assertEqual((first['added'], second['added'], shared['added']), (1, 1, 1))
+        keys = [row[0] for row in self.conn.execute(
+            "SELECT key FROM idempotency_key WHERE key LIKE 'import:%' ORDER BY key"
+        )]
+        self.assertEqual(len(keys), 3)
+        self.assertTrue(any(':private:agent-alice:' in key for key in keys))
+        self.assertTrue(any(':private:agent-bob:' in key for key in keys))
+
+    def test_private_import_honors_owner_private_tombstone_only(self):
+        content = 'private import rejected by alice only'
+        mem_id, _ = core.create_memory(
+            self.conn, self.project, self.alice, content, scope='private'
+        )
+        core.reject(self.conn, mem_id, self.alice, 'alice private rejection')
+        items = [{'summary': content, 'type': 'fact'}]
+        alice_plan = core.plan_import(
+            self.conn, items, self.project, scope='private', agent_id=self.alice
+        )
+        bob_plan = core.plan_import(
+            self.conn, items, self.project, scope='private', agent_id=self.bob
+        )
+        project_plan = core.plan_import(
+            self.conn, items, self.project, scope='project', agent_id=self.bob
+        )
+        self.assertEqual(alice_plan['reasons']['tombstone_blocked'], 1)
+        self.assertEqual(bob_plan['would_add'], 1)
+        self.assertEqual(project_plan['would_add'], 1)
+
     def test_invalid_evidence_fields_match_dry_run_and_real_import(self):
         bad = [{
             'summary': 'malformed evidence binding',
@@ -1133,6 +1626,34 @@ class TestImport(CoreTestBase):
         )
         self.assertEqual(result['added'], 0)
         self.assertEqual(result['skipped'], 1)
+
+
+    def test_invalid_evidence_kind_is_not_silently_rewritten(self):
+        bad = [{
+            'summary': 'typo evidence kind',
+            'evidence': [{'kind': 'commti', 'source_uri': 'git://abc'}],
+        }]
+        plan = core.plan_import(self.conn, bad, self.project)
+        self.assertEqual(plan['reasons']['invalid_evidence'], 1)
+        result = core.import_memories(
+            self.conn, bad, self.project, self.alice, scope='project'
+        )
+        self.assertEqual(result['added'], 0)
+        self.assertEqual(result['skipped'], 1)
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM evidence').fetchone()[0], 0)
+    def test_legacy_source_evidence_is_preserved_in_metadata(self):
+        items = [{'summary': 'legacy source evidence', 'evidence': [
+            {'kind': 'source', 'source_uri': 'file:///legacy', 'source_label': 'legacy'}
+        ]}]
+        plan = core.plan_import(self.conn, items, self.project)
+        self.assertEqual(plan['would_add'], 1)
+        result = core.import_memories(self.conn, items, self.project, self.alice, scope='project')
+        self.assertEqual(result['added'], 1)
+        row = self.conn.execute(
+            "SELECT kind, metadata FROM evidence WHERE source_uri='file:///legacy'"
+        ).fetchone()
+        self.assertEqual(row[0], 'external')
+        self.assertIn('source', row[1])
 
 
 if __name__ == '__main__':
