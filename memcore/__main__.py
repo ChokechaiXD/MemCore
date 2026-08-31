@@ -159,6 +159,97 @@ def cmd_reject(args):
         sys.exit(f'error: {e}')
 
 
+# ── operational tooling ─────────────────────────────────────────────
+
+def cmd_gc(args):
+    """GC retention sweep: dry-run by default, --apply performs actual sweep."""
+    conn = _open(args)
+    candidates, tombstones = core.gc_scan(
+        conn,
+        candidate_days=args.candidate_days,
+        tombstone_days=args.tombstone_days
+    )
+    
+    print(f'GC scan:')
+    print(f'  candidates (lifecycle=candidate, no evidence, age >{args.candidate_days}d): {len(candidates)}')
+    if candidates:
+        for c in candidates:
+            print(f'    {c[0]} (project={c[1]}, created={c[4]})')
+    
+    print(f'  tombstones (age >{args.tombstone_days}d): {len(tombstones)}')
+    if tombstones:
+        for t in tombstones:
+            print(f'    {t[0]} (fingerprint={t[1][:8]}..., reason={t[3]})')
+    
+    if args.apply:
+        tombstoned, purged = core.gc_apply(
+            conn,
+            candidate_days=args.candidate_days,
+            tombstone_days=args.tombstone_days
+        )
+        print(f'  applied: {len(tombstoned)} tombstoned, {len(purged)} purged')
+        if tombstoned:
+            for tid in tombstoned:
+                print(f'    tombstoned: {tid}')
+        if purged:
+            for tid in purged:
+                print(f'    purged: {tid}')
+    
+    conn.close()
+
+
+def cmd_stats(args):
+    """Operational stats: lifecycle/scope counts, top agents, avg length, FTS drift."""
+    conn = _open(args)
+    stats = core.stats(conn)
+    conn.close()
+    _out(stats)
+
+
+def cmd_import(args):
+    """Import memories from JSON file with --agent and --project options."""
+    conn = _open(args)
+    try:
+        with open(args.file, 'r', encoding='utf-8') as f:
+            items = json.load(f)
+        
+        if not isinstance(items, list):
+            sys.exit('error: import file must contain a JSON array of items')
+        
+        project_id = f'proj-{args.project}'
+        agent_id = f'agent-{args.agent}'
+
+        # Operator-run CLI: explicitly ensure the importing agent exists and
+        # is a member before bulk write (ALTIMA gate #3 — explicit, auditable).
+        conn.execute(
+            'INSERT OR IGNORE INTO agent (id, name, profile_key) VALUES (?, ?, ?)',
+            (agent_id, args.agent, args.agent)
+        )
+        conn.execute(
+            'INSERT OR IGNORE INTO project_membership (project_id, agent_id, role) '
+            "VALUES (?, ?, 'member')",
+            (project_id, agent_id)
+        )
+        conn.commit()
+
+        result = core.import_memories(conn, items, project_id, agent_id, scope=args.scope)
+        conn.close()
+        
+        print('import complete:')
+        print(f'  added: {result["added"]}')
+        print(f'  skipped: {result["skipped"]}')
+        if result['created']:
+            print('  created memories:')
+            for mem_id, ver_id in result['created']:
+                print(f'    {mem_id} (version {ver_id})')
+    except core.MemCoreError as e:
+        sys.exit(f'error: {e}')
+    except FileNotFoundError:
+        sys.exit(f'error: file not found: {args.file}')
+    except json.JSONDecodeError as e:
+        sys.exit(f'error: invalid JSON: {e}')
+
+
 # ── doctor ─────────────────────────────────────────────────────────────
 
 def cmd_doctor(args):
@@ -305,8 +396,27 @@ def main(argv=None):
     p = sub.add_parser('reject', help='reject a memory and create a tombstone')
     p.add_argument('memory_id')
     p.add_argument('--agent', required=True)
-    p.add_argument('--reason', required=True)
+    p.add_argument('reason')
     p.set_defaults(func=cmd_reject)
+
+    p = sub.add_parser('gc', help='garbage collection: retention sweep')
+    p.add_argument('--candidate-days', type=int, default=30,
+                   help="candidate memories older than N days with no evidence are gc'd (default 30)")
+    p.add_argument('--tombstone-days', type=int, default=90,
+                   help='tombstones older than N days are purged (default 90)')
+    p.add_argument('--apply', action='store_true',
+                   help='perform the sweep (dry-run otherwise)')
+    p.set_defaults(func=cmd_gc)
+
+    sub.add_parser('stats', help='operational statistics').set_defaults(func=cmd_stats)
+
+    p = sub.add_parser('import', help='import memories from JSON')
+    p.add_argument('--file', required=True, help='JSON file path')
+    p.add_argument('--agent', required=True, help='agent name')
+    p.add_argument('--project', required=True, help='project name')
+    p.add_argument('--scope', default='project', choices=['project', 'private'],
+                   help='scope for imported memories (default project)')
+    p.set_defaults(func=cmd_import)
 
     sub.add_parser('doctor', help='integrity + drift checks').set_defaults(func=cmd_doctor)
 

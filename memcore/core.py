@@ -588,8 +588,12 @@ def import_memories(conn, items, project_id, agent_id, scope='project'):
     """Bulk import: each item {title, summary, type, evidence:[...]} becomes a
     CANDIDATE through core.create_memory (transaction + audit, unchanged).
 
-    Dedup: sha256 fingerprint of the normalized summary — first occurrence
-    in the batch (or already in the store) wins; later ones are skipped.
+    Idempotent: per-item key ``import:<project_id>:<fingerprint(summary)>``
+    replays return the existing memory (ALTIMA gate #1). Dedup within the
+    batch uses the same fingerprint. Per-item try/except also covers the
+    evidence inserts, so a failing item leaves no partial rows (gate #4).
+    NOTE: membership is NOT auto-granted here (Finding G — non-member import
+    must fail closed); the CLI layer ensures membership explicitly (gate #3).
     Returns dict {'added': n, 'skipped': n, 'created': [(mem_id, ver_id)...]}.
     """
     added, skipped, created = 0, 0, []
@@ -603,29 +607,43 @@ def import_memories(conn, items, project_id, agent_id, scope='project'):
         if fp in seen:
             skipped += 1
             continue
+        ikey = f'import:{project_id}:{fp}'
+        already = conn.execute(
+            'SELECT 1 FROM idempotency_key WHERE key = ?', (ikey,)
+        ).fetchone()
+        if already:
+            skipped += 1
+            continue
         try:
             mem_id, ver_id = create_memory(
                 conn, project_id, agent_id,
                 summary, scope=scope,
                 memory_type=item.get('type') or 'fact',
+                idempotency_key=ikey,
             )
-        except TombstoneBlocked:
+            for ev in item.get('evidence') or []:
+                kind = ev.get('kind')
+                # Trust boundary: normalize unknown kinds to the schema's
+                # catch-all instead of crashing mid-batch (batch1 used 'source').
+                if kind not in ('file', 'commit', 'test', 'observation',
+                                'user_input', 'external'):
+                    kind = 'external'
+                ev_id = _new_id('ev')
+                conn.execute(
+                    'INSERT INTO evidence (id, kind, source_uri, source_label) '
+                    'VALUES (?, ?, ?, ?)',
+                    (ev_id, kind, ev.get('source_uri'), ev.get('source_label'))
+                )
+                conn.execute(
+                    'INSERT INTO evidence_link (evidence_id, memory_version_id, relation) '
+                    "VALUES (?, ?, 'supports')",
+                    (ev_id, ver_id)
+                )
+            conn.commit()
+        except (TombstoneBlocked, PermissionDenied, MemCoreError):
             skipped += 1
             continue
         seen.add(fp)
         added += 1
         created.append((mem_id, ver_id))
-        for ev in item.get('evidence') or []:
-            ev_id = _new_id('ev')
-            conn.execute(
-                'INSERT INTO evidence (id, kind, source_uri, source_label) '
-                'VALUES (?, ?, ?, ?)',
-                (ev_id, ev['kind'], ev.get('source_uri'), ev.get('source_label'))
-            )
-            conn.execute(
-                'INSERT INTO evidence_link (evidence_id, memory_version_id, relation) '
-                "VALUES (?, ?, 'supports')",
-                (ev_id, ver_id)
-            )
-    conn.commit()
     return {'added': added, 'skipped': skipped, 'created': created}
