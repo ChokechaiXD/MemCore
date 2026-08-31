@@ -7,7 +7,7 @@
 **Persistent memory without turning raw conversation history into trusted truth.**
 
 [![Status](https://img.shields.io/badge/status-active-success?style=for-the-badge)](https://github.com/ChokechaiXD/MemCore)
-[![Tests](https://img.shields.io/badge/tests-187%20%7C%20gate%20OK-brightgreen?style=for-the-badge)](https://github.com/ChokechaiXD/MemCore)
+[![Tests](https://img.shields.io/badge/tests-193%20%7C%20gate%20OK-brightgreen?style=for-the-badge)](https://github.com/ChokechaiXD/MemCore)
 [![SQLite](https://img.shields.io/badge/storage-SQLite%20%7C%20WAL%20%7C%20FTS5-07405E?style=for-the-badge&logo=sqlite&logoColor=white)](https://sqlite.org/)
 [![Hermes](https://img.shields.io/badge/Hermes-native%20provider-7B61FF?style=for-the-badge)](https://github.com/NousResearch/hermes-agent)
 
@@ -230,7 +230,7 @@ python -m unittest discover -v
 Current gate:
 
 ```text
-187 tests
+193 tests
 OK (expected failures=2)
 ```
 
@@ -285,6 +285,20 @@ python -m memcore import --file batch.json --agent mika --project shared-platfor
 
 `journal-review-decide` preserves the governance boundary: a `remember` verdict can create only a private candidate owned by the event agent. The analyzer cannot choose project scope or accepted lifecycle.
 
+### Hermes plugin deployment
+
+The native Hermes integration is tracked in Git under `integrations/hermes/memcore/`.
+The installed copy in the Hermes plugin directory is treated as a deploy artifact.
+
+```powershell
+python scripts/deploy_hermes_plugin.py --dry-run
+python scripts/deploy_hermes_plugin.py
+python scripts/deploy_hermes_plugin.py --check
+```
+
+Deployment uses an explicit runtime allowlist and SHA-256 verification, so tests,
+`__pycache__`, and unrelated files are never copied into the live plugin.
+
 ### GC behavior
 
 `gc` is conservative by design.
@@ -332,10 +346,15 @@ MemCore/
 │   ├── test_ingest.py
 │   ├── test_semantic_analysis.py
 │   ├── test_journal_cli.py
+│   ├── test_hermes_plugin_source.py
 │   ├── test_evaluations.py
 │   └── test_cli.py
 │
+├── integrations/
+│   └── hermes/memcore/      # Git source of truth for native provider + UI + tests
+│
 └── scripts/
+    ├── deploy_hermes_plugin.py
     ├── bench_search.py
     └── setup_*_scratch.py
 ```
@@ -377,6 +396,7 @@ Current migration head:
 | Tombstone resurrection guard | ✅ Implemented |
 | GC / import / doctor CLI | ✅ Implemented |
 | Native Hermes provider | ✅ Implemented |
+| Git-tracked Hermes plugin + verified deployer | ✅ Implemented |
 | Hermes add/replace/remove bridge | ✅ Implemented |
 | Raw ingest journal | ✅ Implemented |
 | Governed semantic review boundary | ✅ Implemented |
