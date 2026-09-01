@@ -26,13 +26,17 @@ def _load_agent_plugin():
 
 
 agent_plugin = _load_agent_plugin()
-from memcore import core, ingest, store  # noqa: E402
+from memcore import core, ingest, semantic, store  # noqa: E402
+try:  # package load in Hermes
+    from .semantic_analyzer import HermesSemanticAnalyzer  # type: ignore
+except ImportError:  # direct module load in regression tests
+    from semantic_analyzer import HermesSemanticAnalyzer  # type: ignore
 
 logger = logging.getLogger(__name__)
 
 
 class MemCoreMemoryProvider(MemoryProvider):
-    def __init__(self):
+    def __init__(self, plugin_llm=None):
         self._config = {}
         self._profile = ''
         self._project_ref = ''
@@ -43,6 +47,10 @@ class MemCoreMemoryProvider(MemoryProvider):
         self._store_path = ''
         self._budget = 1200
         self._max_items = 8
+        self._plugin_llm = plugin_llm
+        self._semantic_auto_enabled = False
+        self._semantic_max_events = 1
+        self._semantic_analyzer = None
         self._last_recall_count = 0
 
     @property
@@ -71,6 +79,84 @@ class MemCoreMemoryProvider(MemoryProvider):
             return p.name
         return 'default'
 
+    def _configure_semantic_auto_review(self, cfg):
+        """Build the optional host-LLM semantic reviewer without risking provider startup."""
+        self._semantic_auto_enabled = False
+        self._semantic_analyzer = None
+        self._semantic_max_events = 1
+        semantic_cfg = cfg.get('semantic') or {}
+        auto_cfg = semantic_cfg.get('auto_review') or {}
+        enabled = auto_cfg.get('enabled', False)
+        if not isinstance(enabled, bool):
+            logger.warning('MemCore semantic.auto_review.enabled must be boolean; auto-review disabled')
+            return
+        if not enabled:
+            return
+        if self._plugin_llm is None:
+            logger.warning(
+                'MemCore semantic auto-review requested but Hermes plugin LLM facade is unavailable; '
+                'events will remain pending for manual review'
+            )
+            return
+        try:
+            max_events = auto_cfg.get('max_events_per_turn', 1)
+            max_tokens = auto_cfg.get('max_tokens', 256)
+            timeout_seconds = auto_cfg.get('timeout_seconds', 30.0)
+            max_input_chars = auto_cfg.get('max_input_chars', 6000)
+            min_confidence = auto_cfg.get('min_remember_confidence', 0.85)
+            if isinstance(max_events, bool) or not isinstance(max_events, int):
+                raise ValueError('max_events_per_turn must be an integer')
+            if not 1 <= max_events <= 5:
+                raise ValueError('max_events_per_turn must be between 1 and 5')
+            self._semantic_analyzer = HermesSemanticAnalyzer(
+                self._plugin_llm,
+                max_tokens=max_tokens,
+                timeout_seconds=timeout_seconds,
+                max_input_chars=max_input_chars,
+                min_remember_confidence=min_confidence,
+            )
+            self._semantic_max_events = max_events
+            self._semantic_auto_enabled = True
+        except (TypeError, ValueError) as exc:
+            logger.warning('MemCore semantic auto-review config invalid; disabled: %s', exc)
+
+    def _run_auto_semantic_review(self, conn, trigger_event_id=None):
+        """Review a bounded queue slice on Hermes' existing background sync worker."""
+        if not self._semantic_auto_enabled or self._semantic_analyzer is None:
+            return None
+        if trigger_event_id:
+            row = conn.execute(
+                'SELECT event_type FROM ingest_event WHERE id=?', (trigger_event_id,)
+            ).fetchone()
+            if row is None or row[0] != 'turn':
+                return None
+        try:
+            result = semantic.analyze_pending_events(
+                conn,
+                self._project_id,
+                self._agent_id,
+                self._semantic_analyzer,
+                analyzer_name=f'hermes-plugin-llm:{self._profile or "default"}',
+                limit=self._semantic_max_events,
+                metadata={
+                    'source': 'hermes-auto-semantic-review',
+                    'platform': self._platform,
+                    'automatic': True,
+                },
+                continue_on_error=True,
+                decisions=('semantic_review_required',),
+            )
+            if result['examined']:
+                logger.info(
+                    'MemCore semantic auto-review examined=%d succeeded=%d failed=%d',
+                    result['examined'], result['succeeded'], result['failed']
+                )
+            return result
+        except Exception as exc:
+            # Never turn a model/provider outage into a memory-provider failure.
+            logger.warning('MemCore semantic auto-review failed closed: %s', exc)
+            return None
+
     def initialize(self, session_id: str, **kwargs) -> None:
         self._config = self._load_config()
         self._session_id = session_id or ''
@@ -86,6 +172,7 @@ class MemCoreMemoryProvider(MemoryProvider):
         inject_cfg = cfg.get('inject') or {}
         self._budget = max(0, int(inject_cfg.get('budget_chars', 1200)))
         self._max_items = max(0, int(inject_cfg.get('max_items', 8)))
+        self._configure_semantic_auto_review(cfg)
         if cfg.get('auto_join'):
             agent_plugin.auto_join({'config': self._config, 'profile_name': self._profile})
         conn = store.open_store(self._store_path)
@@ -173,6 +260,7 @@ class MemCoreMemoryProvider(MemoryProvider):
                 metadata=self._event_metadata(messages)
             )
             ingest.process_event(conn, event_id)
+            self._run_auto_semantic_review(conn, event_id)
         finally:
             conn.close()
 

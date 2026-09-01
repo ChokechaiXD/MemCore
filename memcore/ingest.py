@@ -14,6 +14,7 @@ EVENT_TYPES = {'turn', 'memory_write', 'delegation', 'session_end', 'manual'}
 MAX_FIELD_CHARS = 65536
 MAX_ANALYSIS_CANDIDATE_CHARS = 4000
 SEMANTIC_VERDICTS = {'remember', 'ignore', 'defer'}
+SEMANTIC_QUEUE_DECISIONS = {'semantic_review_required', 'semantic_deferred'}
 
 _TRIVIAL_RE = re.compile(
     r'^(?:ok|okay|yes|no|thanks|thank you|hi|hey|hello|continue|next|done|'
@@ -112,17 +113,30 @@ def classify_user_text(text):
     return 'review', 'semantic_review_required', ''
 
 
-def pending_semantic_events(conn, project_id, agent_id, *, limit=20):
+def pending_semantic_events(conn, project_id, agent_id, *, limit=20, decisions=None):
     """Return this agent's pending semantic-review queue without cross-agent leakage."""
     if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0 or limit > 100:
         raise core.MemCoreError('semantic review limit must be an integer from 1 to 100')
+    if decisions is None:
+        selected_decisions = sorted(SEMANTIC_QUEUE_DECISIONS)
+    else:
+        if isinstance(decisions, str) or not isinstance(decisions, (list, tuple, set, frozenset)):
+            raise core.MemCoreError('semantic queue decisions must be a non-empty collection')
+        selected_decisions = sorted(set(decisions))
+        if not selected_decisions:
+            raise core.MemCoreError('semantic queue decisions must be a non-empty collection')
+        invalid = sorted(set(selected_decisions) - SEMANTIC_QUEUE_DECISIONS)
+        if invalid:
+            raise core.MemCoreError(
+                'invalid semantic queue decision(s): ' + ', '.join(invalid)
+            )
     core._require_membership(conn, project_id, agent_id)
     rows = conn.execute(
         'SELECT id, event_type, user_content, assistant_content, metadata, decision, created_at '
         'FROM ingest_event WHERE project_id=? AND agent_id=? AND status=\'pending\' '
-        "AND decision IN ('semantic_review_required','semantic_deferred') "
+        'AND decision IN (' + ','.join('?' for _ in selected_decisions) + ') '
         'ORDER BY created_at, id LIMIT ?',
-        (project_id, agent_id, limit)
+        (project_id, agent_id, *selected_decisions, limit)
     ).fetchall()
     results = []
     for event_id, event_type, user_content, assistant_content, metadata_raw, decision, created_at in rows:

@@ -139,6 +139,32 @@ class SemanticAnalysisTests(unittest.TestCase):
                 self.conn, explicit, self.alice, analyzer='late', verdict='ignore'
             )
 
+    def test_pending_queue_can_filter_review_vs_deferred_decisions(self):
+        event_id = self.pending_event()
+        review_only = ingest.pending_semantic_events(
+            self.conn, self.project, self.alice,
+            decisions=('semantic_review_required',)
+        )
+        self.assertEqual([item['event_id'] for item in review_only], [event_id])
+        ingest.apply_semantic_analysis(
+            self.conn, event_id, self.alice,
+            analyzer='filter-test', verdict='defer', rationale='later'
+        )
+        self.assertEqual(ingest.pending_semantic_events(
+            self.conn, self.project, self.alice,
+            decisions=('semantic_review_required',)
+        ), [])
+        deferred = ingest.pending_semantic_events(
+            self.conn, self.project, self.alice,
+            decisions=('semantic_deferred',)
+        )
+        self.assertEqual([item['event_id'] for item in deferred], [event_id])
+        with self.assertRaises(core.MemCoreError):
+            ingest.pending_semantic_events(
+                self.conn, self.project, self.alice,
+                decisions=('builtin_memory_replace_unresolved_target',)
+            )
+
     def test_validation_fails_closed(self):
         event_id = self.pending_event()
         with self.assertRaises(core.MemCoreError):

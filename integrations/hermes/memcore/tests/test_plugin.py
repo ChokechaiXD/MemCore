@@ -157,6 +157,9 @@ class TestRegistrationBridge(unittest.TestCase):
                     self.provider = None
                     self.hooks = []
                     self.tools = []
+                    self.llm = type(
+                        'FakeLlm', (), {'complete_structured': lambda self, **kwargs: None}
+                    )()
                 def register_memory_provider(self, provider):
                     self.provider = provider
                 def register_hook(self, *args, **kwargs):
@@ -168,6 +171,7 @@ class TestRegistrationBridge(unittest.TestCase):
             registration.register(ctx)
             self.assertIsNotNone(ctx.provider)
             self.assertEqual(ctx.provider.name, 'memcore')
+            self.assertIs(ctx.provider._plugin_llm, ctx.llm)
             self.assertEqual(ctx.hooks, [])
             self.assertEqual(ctx.tools, [])
             self.assertEqual(len(ctx.provider.get_tool_schemas()), 6)

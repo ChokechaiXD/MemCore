@@ -130,7 +130,8 @@ def normalize_analysis_result(result):
 
 
 def analyze_pending_events(conn, project_id, agent_id, analyzer, *, analyzer_name,
-                           limit=20, metadata=None, continue_on_error=True):
+                           limit=20, metadata=None, continue_on_error=True,
+                           decisions=None):
     """Analyze one bounded snapshot of the agent's semantic-review queue.
 
     The queue source itself excludes unresolved builtin replace/remove ambiguity.
@@ -149,7 +150,9 @@ def analyze_pending_events(conn, project_id, agent_id, analyzer, *, analyzer_nam
     except (TypeError, ValueError) as exc:
         raise SemanticAnalyzerError(f'batch metadata must be JSON-serializable: {exc}') from exc
 
-    events = ingest.pending_semantic_events(conn, project_id, agent_id, limit=limit)
+    events = ingest.pending_semantic_events(
+        conn, project_id, agent_id, limit=limit, decisions=decisions
+    )
     results = []
     for event in events:
         safe_event = _safe_event(event)

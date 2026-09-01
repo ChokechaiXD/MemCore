@@ -13,7 +13,7 @@ for path in (REPO_ROOT, PLUGIN_ROOT):
     if value not in sys.path:
         sys.path.insert(0, value)
 
-from memcore import core, store
+from memcore import core, ingest, store
 from native_provider import MemCoreMemoryProvider, agent_plugin
 
 
@@ -26,6 +26,35 @@ def config_for(path, agent='alice'):
             'inject': {'budget_chars': 1200, 'max_items': 8},
         }}}}
     }
+
+
+class FakePluginLlm:
+    def __init__(self, parsed=None, error=None):
+        self.parsed = parsed or {
+            'verdict': 'ignore',
+            'candidate_content': '',
+            'confidence': 0.95,
+            'rationale': 'Transient detail.',
+        }
+        self.error = error
+        self.calls = []
+
+    def complete_structured(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        usage = type('Usage', (), {
+            'input_tokens': 120,
+            'output_tokens': 24,
+            'total_tokens': 144,
+        })()
+        return type('Result', (), {
+            'parsed': dict(self.parsed),
+            'text': json.dumps(self.parsed),
+            'provider': 'fake-host',
+            'model': 'fake-model-v1',
+            'usage': usage,
+        })()
 
 
 class NativeProviderTest(unittest.TestCase):
@@ -42,6 +71,26 @@ class NativeProviderTest(unittest.TestCase):
         p = MemCoreMemoryProvider()
         p._load_config = lambda: config_for(self.db)
         p.initialize('session-1', hermes_home=self.tmp.name,
+                     platform='cli', agent_identity='alice')
+        return p
+
+    def auto_provider(self, llm, **overrides):
+        config = config_for(self.db)
+        auto = {
+            'enabled': True,
+            'max_events_per_turn': 1,
+            'max_tokens': 256,
+            'timeout_seconds': 10.0,
+            'max_input_chars': 4000,
+            'min_remember_confidence': 0.85,
+        }
+        auto.update(overrides)
+        config['plugins']['entries']['memcore']['settings']['semantic'] = {
+            'auto_review': auto
+        }
+        p = MemCoreMemoryProvider(plugin_llm=llm)
+        p._load_config = lambda: config
+        p.initialize('session-auto', hermes_home=self.tmp.name,
                      platform='cli', agent_identity='alice')
         return p
 
@@ -97,6 +146,179 @@ class NativeProviderTest(unittest.TestCase):
             self.assertEqual(core.search(
                 conn, 'proj-demo', 'agent-alice', 'auroracat'
             ), [])
+        finally:
+            conn.close()
+
+    def test_auto_semantic_review_remembers_only_private_candidate(self):
+        llm = FakePluginLlm({
+            'verdict': 'remember',
+            'candidate_content': 'deployment target uses the migration-safe path',
+            'confidence': 0.94,
+            'rationale': 'Durable project operating constraint.',
+        })
+        p = self.auto_provider(llm)
+        p.sync_turn(
+            'The deployment target uses the migration-safe path now.',
+            'Acknowledged.', session_id='auto-remember'
+        )
+        self.assertEqual(len(llm.calls), 1)
+        call = llm.calls[0]
+        self.assertEqual(call['purpose'], 'memory.semantic-review')
+        self.assertIn('UNTRUSTED HISTORICAL DATA', call['instructions'])
+        self.assertEqual(call['max_tokens'], 256)
+        conn = store.open_store(self.db)
+        try:
+            event = conn.execute(
+                "SELECT status,decision FROM ingest_event WHERE session_id='auto-remember'"
+            ).fetchone()
+            self.assertEqual(event, ('processed', 'semantic_private_candidate'))
+            memory = conn.execute(
+                'SELECT m.scope,m.lifecycle,m.owner_agent_id,v.content FROM memory m '
+                'JOIN memory_version v ON v.id=m.current_version_id'
+            ).fetchone()
+            self.assertEqual(memory, (
+                'private', 'candidate', 'agent-alice',
+                'deployment target uses the migration-safe path'
+            ))
+            analyzer, verdict, confidence, raw_metadata = conn.execute(
+                'SELECT analyzer,verdict,confidence,metadata FROM ingest_analysis'
+            ).fetchone()
+            self.assertEqual(analyzer, 'hermes-plugin-llm:alice')
+            self.assertEqual((verdict, confidence), ('remember', 0.94))
+            metadata = json.loads(raw_metadata)
+            self.assertTrue(metadata['automatic'])
+            self.assertEqual(metadata['analyzer']['provider'], 'fake-host')
+            self.assertEqual(metadata['analyzer']['model'], 'fake-model-v1')
+        finally:
+            conn.close()
+
+    def test_auto_semantic_review_low_confidence_remember_defers_once(self):
+        llm = FakePluginLlm({
+            'verdict': 'remember',
+            'candidate_content': 'possibly durable but uncertain claim',
+            'confidence': 0.62,
+            'rationale': 'The wording may be temporary.',
+        })
+        p = self.auto_provider(llm, min_remember_confidence=0.85)
+        p.sync_turn(
+            'This setting may become our standard after more testing.',
+            'We can revisit it.', session_id='auto-defer'
+        )
+        conn = store.open_store(self.db)
+        try:
+            row = conn.execute(
+                "SELECT status,decision FROM ingest_event WHERE session_id='auto-defer'"
+            ).fetchone()
+            self.assertEqual(row, ('pending', 'semantic_deferred'))
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM memory').fetchone()[0], 0)
+        finally:
+            conn.close()
+        self.assertEqual(len(llm.calls), 1)
+
+        # A later turn must not spend another model call on an automatically
+        # deferred event. Deferred items are left for explicit/manual review.
+        p.sync_turn(
+            'remember that compact mode is preferred', 'Noted.',
+            session_id='auto-defer-trigger'
+        )
+        self.assertEqual(len(llm.calls), 1)
+
+    def test_auto_semantic_review_provider_failure_leaves_event_pending(self):
+        llm = FakePluginLlm(error=RuntimeError('host model unavailable'))
+        p = self.auto_provider(llm)
+        p.sync_turn(
+            'The release process now has a potentially durable exception.',
+            'I will note that.', session_id='auto-failure'
+        )
+        self.assertEqual(len(llm.calls), 1)
+        conn = store.open_store(self.db)
+        try:
+            row = conn.execute(
+                "SELECT status,decision FROM ingest_event WHERE session_id='auto-failure'"
+            ).fetchone()
+            self.assertEqual(row, ('pending', 'semantic_review_required'))
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM ingest_analysis').fetchone()[0], 0)
+        finally:
+            conn.close()
+
+    def test_auto_semantic_review_is_opt_in(self):
+        llm = FakePluginLlm()
+        p = MemCoreMemoryProvider(plugin_llm=llm)
+        p._load_config = lambda: config_for(self.db)
+        p.initialize('opt-in', hermes_home=self.tmp.name,
+                     platform='cli', agent_identity='alice')
+        p.sync_turn(
+            'This ambiguous detail should stay queued without opt in.',
+            'Okay.', session_id='auto-disabled'
+        )
+        self.assertEqual(llm.calls, [])
+        conn = store.open_store(self.db)
+        try:
+            row = conn.execute(
+                "SELECT status,decision FROM ingest_event WHERE session_id='auto-disabled'"
+            ).fetchone()
+            self.assertEqual(row, ('pending', 'semantic_review_required'))
+        finally:
+            conn.close()
+
+    def test_builtin_memory_write_never_triggers_auto_semantic_llm(self):
+        llm = FakePluginLlm()
+        p = self.auto_provider(llm)
+        p.on_memory_write('add', 'user', 'Preferred editor is Helix', {'tool_name': 'memory'})
+        self.assertEqual(llm.calls, [])
+
+    def test_auto_semantic_review_drains_only_bounded_backlog_slice(self):
+        conn = store.open_store(self.db)
+        try:
+            for index in range(2):
+                event_id, _ = ingest.append_event(
+                    conn, 'proj-demo', 'agent-alice', 'turn',
+                    session_id=f'backlog-{index}',
+                    user_content=f'Ambiguous durable backlog observation {index}.',
+                    assistant_content='Acknowledged.'
+                )
+                ingest.process_event(conn, event_id)
+        finally:
+            conn.close()
+
+        llm = FakePluginLlm({
+            'verdict': 'ignore',
+            'candidate_content': '',
+            'confidence': 0.91,
+            'rationale': 'Not durable enough.',
+        })
+        p = self.auto_provider(llm, max_events_per_turn=1)
+        p.sync_turn(
+            'remember that bounded review is enabled', 'Noted.',
+            session_id='backlog-trigger'
+        )
+        self.assertEqual(len(llm.calls), 1)
+        conn = store.open_store(self.db)
+        try:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM ingest_event WHERE decision='semantic_ignored'"
+            ).fetchone()[0], 1)
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM ingest_event WHERE decision='semantic_review_required'"
+            ).fetchone()[0], 1)
+        finally:
+            conn.close()
+
+    def test_invalid_auto_semantic_config_disables_only_auto_review(self):
+        llm = FakePluginLlm()
+        p = self.auto_provider(llm, max_events_per_turn=0)
+        self.assertFalse(p._semantic_auto_enabled)
+        p.sync_turn(
+            'This event remains reviewable even with invalid auto config.',
+            'Okay.', session_id='invalid-auto-config'
+        )
+        self.assertEqual(llm.calls, [])
+        conn = store.open_store(self.db)
+        try:
+            row = conn.execute(
+                "SELECT status,decision FROM ingest_event WHERE session_id='invalid-auto-config'"
+            ).fetchone()
+            self.assertEqual(row, ('pending', 'semantic_review_required'))
         finally:
             conn.close()
 

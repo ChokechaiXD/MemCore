@@ -7,7 +7,7 @@
 **Persistent memory without turning raw conversation history into trusted truth.**
 
 [![Status](https://img.shields.io/badge/status-active-success?style=for-the-badge)](https://github.com/ChokechaiXD/MemCore)
-[![Tests](https://img.shields.io/badge/tests-201%20%7C%20gate%20OK-brightgreen?style=for-the-badge)](https://github.com/ChokechaiXD/MemCore)
+[![Tests](https://img.shields.io/badge/tests-202%20%7C%20gate%20OK-brightgreen?style=for-the-badge)](https://github.com/ChokechaiXD/MemCore)
 [![SQLite](https://img.shields.io/badge/storage-SQLite%20%7C%20WAL%20%7C%20FTS5-07405E?style=for-the-badge&logo=sqlite&logoColor=white)](https://sqlite.org/)
 [![Hermes](https://img.shields.io/badge/Hermes-native%20provider-7B61FF?style=for-the-badge)](https://github.com/NousResearch/hermes-agent)
 
@@ -202,6 +202,7 @@ The provider supports:
 | Built-in memory remove | Rejects + tombstones the exact mirrored claim |
 | Delegation | Captures raw delegation context without automatic recall |
 | Semantic queue | Exposes only owner-scoped pending review events |
+| Automatic semantic review | Optional bounded Hermes host-LLM side call; never enters the agent/tool loop |
 
 Recall output retains per-item trust labels such as:
 
@@ -211,6 +212,14 @@ Recall output retains per-item trust labels such as:
 ```
 
 This prevents an outer prompt wrapper from accidentally making tentative memory appear authoritative.
+
+When `semantic.auto_review.enabled: true`, the Hermes integration uses the host-owned
+`ctx.llm.complete_structured()` side-call surface to review a bounded number of new
+`semantic_review_required` events on the existing background memory-sync worker. The
+call does not enter the agent conversation or tool loop, so it cannot recursively
+create another MemCore turn. Low-confidence `remember` proposals are downgraded to
+`defer`, deferred events are left for explicit review, and provider failures leave the
+raw journal event pending.
 
 ---
 
@@ -241,7 +250,7 @@ python -m unittest discover -v
 Current gate:
 
 ```text
-201 tests
+202 tests
 OK (expected failures=2)
 ```
 
@@ -415,6 +424,7 @@ Current migration head:
 | Governed semantic review boundary | ✅ Implemented |
 | Journal operations / health CLI | ✅ Implemented |
 | Provider-agnostic automatic semantic analyzer adapter | ✅ Implemented |
+| Hermes host-LLM automatic semantic review | ✅ Implemented (opt-in) |
 
 ---
 

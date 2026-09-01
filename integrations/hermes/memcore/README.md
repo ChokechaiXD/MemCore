@@ -20,7 +20,7 @@ memcore/
 └── tests/                   # integration regression suite
 ```
 
-Agent, dashboard, and desktop manifests use the same integration version: **0.3.0**.
+Agent, dashboard, and desktop manifests use the same integration version: **0.4.0**.
 
 ## Deploy / verify
 
@@ -72,6 +72,14 @@ plugins:
         inject:
           budget_chars: 1200
           max_items: 8
+        semantic:
+          auto_review:
+            enabled: true
+            max_events_per_turn: 1
+            max_tokens: 256
+            timeout_seconds: 30
+            max_input_chars: 6000
+            min_remember_confidence: 0.85
 
 memory:
   provider: memcore
@@ -80,6 +88,15 @@ memory:
 Identity and project scope come from configuration, never model-controlled tool
 arguments. If the configured project or membership cannot be resolved, the plugin
 fails closed.
+
+`semantic.auto_review.enabled` is opt-in. When enabled, completed Hermes turns are
+reviewed on Hermes' existing background memory-sync worker with the host-owned
+`ctx.llm.complete_structured()` one-shot API. The reviewer never enters the agent
+conversation/tool loop, processes at most `max_events_per_turn`, and only consumes
+`semantic_review_required` events. A `defer` result is not automatically retried;
+it remains pending for explicit/manual review. `remember` below
+`min_remember_confidence` is downgraded to `defer`. Provider/model failures leave
+the raw event unchanged and pending.
 
 ## Memory behavior
 

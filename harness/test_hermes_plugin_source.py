@@ -18,7 +18,8 @@ _spec.loader.exec_module(deploy)
 class HermesPluginSourceTests(unittest.TestCase):
     def test_runtime_source_is_fully_tracked_by_explicit_allowlist(self):
         self.assertEqual(set(deploy.RUNTIME_FILES), {
-            '__init__.py', 'plugin.yaml', 'plugin.py', 'native_provider.py', 'README.md',
+            '__init__.py', 'plugin.yaml', 'plugin.py', 'native_provider.py',
+            'semantic_analyzer.py', 'README.md',
             'dashboard/plugin_api.py', 'dashboard/manifest.json', 'desktop/plugin.js',
         })
         for relative in deploy.RUNTIME_FILES:
@@ -36,7 +37,7 @@ class HermesPluginSourceTests(unittest.TestCase):
             (PLUGIN_ROOT / 'dashboard' / 'manifest.json').read_text(encoding='utf-8')
         )
         desktop = (PLUGIN_ROOT / 'desktop' / 'plugin.js').read_text(encoding='utf-8')
-        self.assertEqual(version, '0.3.0')
+        self.assertEqual(version, '0.4.0')
         self.assertEqual(manifest['version'], version)
         self.assertIn(f"version: '{version}'", desktop)
 
