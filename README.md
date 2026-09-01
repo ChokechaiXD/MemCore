@@ -7,7 +7,7 @@
 **Persistent memory without turning raw conversation history into trusted truth.**
 
 [![Status](https://img.shields.io/badge/status-active-success?style=for-the-badge)](https://github.com/ChokechaiXD/MemCore)
-[![Tests](https://img.shields.io/badge/tests-193%20%7C%20gate%20OK-brightgreen?style=for-the-badge)](https://github.com/ChokechaiXD/MemCore)
+[![Tests](https://img.shields.io/badge/tests-201%20%7C%20gate%20OK-brightgreen?style=for-the-badge)](https://github.com/ChokechaiXD/MemCore)
 [![SQLite](https://img.shields.io/badge/storage-SQLite%20%7C%20WAL%20%7C%20FTS5-07405E?style=for-the-badge&logo=sqlite&logoColor=white)](https://sqlite.org/)
 [![Hermes](https://img.shields.io/badge/Hermes-native%20provider-7B61FF?style=for-the-badge)](https://github.com/NousResearch/hermes-agent)
 
@@ -157,6 +157,17 @@ ignore   → close the event without creating memory
 defer    → leave the event pending for later review
 ```
 
+`memcore.semantic.analyze_pending_events(...)` is the provider-agnostic automatic
+adapter. It accepts any callable or object exposing `analyze(event)`, labels raw
+journal text as untrusted historical data, validates a strict result schema, and
+routes every successful verdict through `ingest.apply_semantic_analysis()`.
+
+Analyzer output may contain only `verdict`, `candidate_content`, `confidence`,
+`rationale`, and analyzer metadata. Attempts to control `scope`, `lifecycle`,
+`project_id`, `memory_type`, verification, freshness, or other governance fields
+are rejected and leave the event pending. Provider failures can be isolated per
+event so a bounded batch continues without losing raw journal data.
+
 Each semantic decision can retain:
 
 - analyzer identity
@@ -230,7 +241,7 @@ python -m unittest discover -v
 Current gate:
 
 ```text
-193 tests
+201 tests
 OK (expected failures=2)
 ```
 
@@ -332,6 +343,7 @@ MemCore/
 ├── memcore/
 │   ├── core.py              # memory lifecycle, search, GC, import, governance
 │   ├── ingest.py            # raw journal, mutation bridge, semantic review
+│   ├── semantic.py          # provider-agnostic automatic analyzer adapter
 │   ├── store.py             # SQLite/WAL configuration and migrations
 │   └── __main__.py          # operational CLI + doctor
 │
@@ -345,6 +357,7 @@ MemCore/
 │   ├── test_core.py
 │   ├── test_ingest.py
 │   ├── test_semantic_analysis.py
+│   ├── test_semantic_adapter.py
 │   ├── test_journal_cli.py
 │   ├── test_hermes_plugin_source.py
 │   ├── test_evaluations.py
@@ -401,7 +414,7 @@ Current migration head:
 | Raw ingest journal | ✅ Implemented |
 | Governed semantic review boundary | ✅ Implemented |
 | Journal operations / health CLI | ✅ Implemented |
-| External automatic semantic analyzer | 🚧 Adapter boundary ready |
+| Provider-agnostic automatic semantic analyzer adapter | ✅ Implemented |
 
 ---
 
