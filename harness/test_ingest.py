@@ -42,7 +42,7 @@ class TestIngestJournal(IngestTestBase):
         self.assertIn('ingest_event', names)
         self.assertIn('ingest_derivation', names)
         self.assertIn('ingest_analysis', names)
-        self.assertEqual(store.MIGRATIONS[-1][0], '0010_performance_fast_paths')
+        self.assertEqual(store.MIGRATIONS[-1][0], '0011_performance_round2')
 
     def test_append_is_retry_safe(self):
         kwargs = dict(

@@ -229,6 +229,11 @@ CREATE INDEX IF NOT EXISTS idx_audit_mutation_recovery
 ON audit_event(project_id, actor_agent_id, action, id DESC);
 """
 
+_PERFORMANCE_ROUND2 = """
+CREATE INDEX IF NOT EXISTS idx_memory_project_claim
+ON memory(project_id, scope, claim_fingerprint, lifecycle);
+"""
+
 MIGRATIONS = [
     ('0001_initial_contract', None),  # None = apply schema.sql verbatim
     ('0002_fts_sync_triggers', _FTS_TRIGGERS),
@@ -253,6 +258,7 @@ CREATE INDEX IF NOT EXISTS idx_tombstone_fingerprint ON tombstone(claim_fingerpr
     ('0008_ingest_journal', _INGEST_JOURNAL),
     ('0009_semantic_analysis', _SEMANTIC_ANALYSIS),
     ('0010_performance_fast_paths', _PERFORMANCE_FAST_PATHS),
+    ('0011_performance_round2', _PERFORMANCE_ROUND2),
 ]
 
 

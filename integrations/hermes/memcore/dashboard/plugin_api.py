@@ -114,30 +114,44 @@ def _store_path():
 _local = threading.local()
 
 
-def _db():
+_PROJECT_ID_CACHE = {}
+
+
+def _db(readonly=False):
     # FastAPI runs sync handlers on a thread pool — connections must be
-    # thread-local (sqlite3 forbids cross-thread reuse by default). Reopen if
-    # the configured store path changes while the desktop process stays alive.
+    # thread-local (sqlite3 forbids cross-thread reuse by default).
+    # Uses fast runtime openers to avoid migration locks on read paths.
     path = str(pathlib.Path(_store_path()).expanduser())
+    if not pathlib.Path(path).exists():
+        return None
     conn = getattr(_local, 'conn', None)
     current_path = getattr(_local, 'path', None)
-    if conn is not None and current_path != path:
+    current_ro = getattr(_local, 'readonly', False)
+    if conn is not None and (current_path != path or (not readonly and current_ro)):
         try:
             conn.close()
         except Exception:
             pass
-        conn = None
+        conn = _local.conn = None
     if conn is None:
         from memcore import store
-        if not pathlib.Path(path).exists():
-            return None
-        conn = _local.conn = store.open_store(path)
+        try:
+            if readonly:
+                conn = _local.conn = store.open_runtime_store_readonly(path)
+                _local.readonly = True
+            else:
+                conn = _local.conn = store.open_runtime_store(path)
+                _local.readonly = False
+        except Exception:
+            # Fallback to bootstrap opener if runtime open fails (e.g. unmigrated)
+            conn = _local.conn = store.open_store(path)
+            _local.readonly = False
         _local.path = path
     return conn
 
 
-def _rows(sql, args=()):
-    db = _db()
+def _rows(sql, args=(), readonly=True):
+    db = _db(readonly=readonly)
     if db is None:
         return []
     return db.execute(sql, args).fetchall()
@@ -155,11 +169,17 @@ def _bounded_limit(value, maximum=500):
 
 def _resolve_project_id(db, project_ref):
     """Resolve exact project id/UUID or a unique project name/slug."""
+    cache_key = (getattr(_local, 'path', ''), str(project_ref))
+    if cache_key in _PROJECT_ID_CACHE:
+        return _PROJECT_ID_CACHE[cache_key]
     direct = db.execute(
         'SELECT id FROM project WHERE id=?', (project_ref,)
     ).fetchone()
     if direct:
-        return direct[0]
+        pid = direct[0]
+        if len(_PROJECT_ID_CACHE) < 128:
+            _PROJECT_ID_CACHE[cache_key] = pid
+        return pid
     by_name = db.execute(
         'SELECT id FROM project WHERE name=? ORDER BY id', (project_ref,)
     ).fetchall()
@@ -168,11 +188,17 @@ def _resolve_project_id(db, project_ref):
             status_code=409, detail=f'ambiguous project name: {project_ref}'
         )
     if by_name:
-        return by_name[0][0]
+        pid = by_name[0][0]
+        if len(_PROJECT_ID_CACHE) < 128:
+            _PROJECT_ID_CACHE[cache_key] = pid
+        return pid
     legacy = 'proj-' + project_ref
     row = db.execute('SELECT id FROM project WHERE id=?', (legacy,)).fetchone()
     if row:
-        return row[0]
+        pid = row[0]
+        if len(_PROJECT_ID_CACHE) < 128:
+            _PROJECT_ID_CACHE[cache_key] = pid
+        return pid
     raise HTTPException(status_code=404, detail=f'project not found: {project_ref}')
 
 
@@ -197,8 +223,8 @@ def _audit_json(action, actor, memory_id, detail, created_at=None):
 
 
 @router.get('/state')
-def state(project=None):
-    db = _db()
+def state(project=None, include_memberships: bool = True):
+    db = _db(readonly=True)
     if db is None:
         return {'store': None}
     pid = _resolve_project_id(db, project) if project else None
@@ -209,23 +235,25 @@ def state(project=None):
     else:
         counts = dict(db.execute(
             'SELECT lifecycle, COUNT(*) FROM memory GROUP BY lifecycle').fetchall())
-    members = _rows(
-        'SELECT p.name, a.name, pm.role FROM project_membership pm '
-        'JOIN project p ON p.id = pm.project_id '
-        'JOIN agent a ON a.id = pm.agent_id '
-        'WHERE (? IS NULL OR pm.project_id = ?) ORDER BY p.name, a.name',
-        (pid, pid))
-    return {
+    res = {
         'store': _store_path(),
         'counts': counts,
-        'memberships': [{'project': r[0], 'agent': r[1], 'role': r[2]} for r in members],
     }
+    if str(include_memberships).lower() not in ('false', '0'):
+        members = _rows(
+            'SELECT p.name, a.name, pm.role FROM project_membership pm '
+            'JOIN project p ON p.id = pm.project_id '
+            'JOIN agent a ON a.id = pm.agent_id '
+            'WHERE (? IS NULL OR pm.project_id = ?) ORDER BY p.name, a.name',
+            (pid, pid))
+        res['memberships'] = [{'project': r[0], 'agent': r[1], 'role': r[2]} for r in members]
+    return res
 
 
 @router.get('/memories')
 def memories(state='candidate', project=None, limit=100):
     limit = _bounded_limit(limit)
-    db = _db()
+    db = _db(readonly=True)
     if db is None:
         return {'state': state, 'items': []}
     pid = _resolve_project_id(db, project) if project else None
@@ -240,12 +268,12 @@ def memories(state='candidate', project=None, limit=100):
             rows = db.execute(
                 'SELECT id, claim_fingerprint, scope, reason, created_at FROM tombstone '
                 "WHERE scope IN (?, 'global') OR substr(scope,1,length(?))=? "
-                'ORDER BY datetime(created_at) DESC, id DESC LIMIT ?',
+                'ORDER BY created_at DESC, id DESC LIMIT ?',
                 (pid, private_prefix, private_prefix, limit)).fetchall()
         else:
             rows = _rows(
                 'SELECT id, claim_fingerprint, scope, reason, created_at FROM tombstone '
-                'ORDER BY datetime(created_at) DESC, id DESC LIMIT ?', (limit,))
+                'ORDER BY created_at DESC, id DESC LIMIT ?', (limit,))
         return {'state': state, 'items': [
             {'id': r[0], 'fingerprint': r[1], 'scope': r[2],
              'reason': r[3], 'created_at': r[4]} for r in rows]}
@@ -260,7 +288,7 @@ def memories(state='candidate', project=None, limit=100):
         args.append(pid)
     args.append(limit)
     rows = _rows(_MEMORY_SELECT + 'WHERE ' + where +
-                 ' ORDER BY m.pinned DESC, datetime(v.created_at) DESC, m.id ASC LIMIT ?', args)
+                 ' ORDER BY m.pinned DESC, v.created_at DESC, m.id ASC LIMIT ?', args)
     return {'state': state, 'items': [_memory_dict(r) for r in rows]}
 
 
@@ -270,7 +298,7 @@ def search(q='', project=None, limit=25):
     if not q.strip():
         return {'query': q, 'items': []}
     from memcore import core
-    db = _db()
+    db = _db(readonly=True)
     if db is None:
         return {'query': q, 'items': []}
     pid = _resolve_project_id(db, project) if project else None
@@ -283,7 +311,7 @@ def search(q='', project=None, limit=25):
         if pid:
             sql += 'AND m.project_id = ? '
             args.append(pid)
-        sql += 'ORDER BY m.pinned DESC, datetime(v.created_at) DESC, m.id ASC LIMIT ?'
+        sql += 'ORDER BY m.pinned DESC, v.created_at DESC, m.id ASC LIMIT ?'
         args.append(limit)
         rows = db.execute(sql, args).fetchall()
         if rows:
@@ -314,10 +342,10 @@ def memory_detail(memory_id):
     versions = _rows(
         'SELECT id, content, created_at, supersedes_version_id '
         'FROM memory_version WHERE memory_id = ? '
-        'ORDER BY datetime(created_at), id', (memory_id,))
+        'ORDER BY created_at ASC, id ASC', (memory_id,))
     audit = _rows(
         'SELECT id, action, actor_agent_id, detail, created_at FROM audit_event '
-        'WHERE memory_id = ? ORDER BY datetime(created_at), id', (memory_id,))
+        'WHERE memory_id = ? ORDER BY created_at ASC, id ASC', (memory_id,))
     evidence = _rows(
         'SELECT DISTINCT e.id, e.kind, e.source_uri, e.source_label FROM evidence e '
         'JOIN evidence_link el ON el.evidence_id = e.id '
@@ -346,7 +374,7 @@ def projects():
 # -- Management actions (human operator via UI; audited as 'dashboard') ------
 
 def _audit(action, memory_id, detail):
-    db = _db()
+    db = _db(readonly=False)
     if db is None:
         return
     # actor_agent_id is an FK to agent(id) since migration 0004 — the human
@@ -366,7 +394,7 @@ def _audit(action, memory_id, detail):
 
 @router.post('/promote')
 def promote(body: dict):
-    db = _db()
+    db = _db(readonly=False)
     if db is None:
         return {'error': 'store unavailable'}
     memory_id = (body or {}).get('memory_id')
@@ -417,7 +445,7 @@ def promote(body: dict):
 
 @router.post('/pin')
 def pin(body: dict):
-    db = _db()
+    db = _db(readonly=False)
     if db is None:
         return {'error': 'store unavailable'}
     memory_id = (body or {}).get('memory_id')
@@ -446,7 +474,7 @@ def pin(body: dict):
 
 @router.post('/disable')
 def disable(body: dict):
-    db = _db()
+    db = _db(readonly=False)
     if db is None:
         return {'error': 'store unavailable'}
     memory_id = (body or {}).get('memory_id')

@@ -18,7 +18,7 @@ import {
   useQueryClient,
   host
 } from '@hermes/plugin-sdk'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Fragment, jsx, jsxs } from 'react/jsx-runtime'
 
 const PLUGIN_ID = 'memcore'
@@ -78,15 +78,27 @@ function createMemcoreApi(ctx) {
   const get = (path, params) => ctx.rest(makePath(path, params))
   const post = (path, body) => ctx.rest(path, { method: 'POST', body })
   return {
-    state: () => get('/state'),
+    state: () => get('/state', { include_memberships: false }),
     memories: (view, project) => get('/memories', { state: view, project }),
     search: (q, project) => get('/search', { q, project }),
     detail: id => get(`/memory/${encodeURIComponent(id)}`),
-    projects: () => get('/projects'),
     promote: memory_id => post('/promote', { memory_id }),
     pin: (memory_id, pinned) => post('/pin', { memory_id, pinned }),
     disable: memory_id => post('/disable', { memory_id })
   }
+}
+
+function useDebouncedValue(value, delayMs = 180) {
+  const [debounced, setDebounced] = useState(value)
+  useEffect(() => {
+    if (!value) {
+      setDebounced('')
+      return undefined
+    }
+    const handle = setTimeout(() => setDebounced(value), delayMs)
+    return () => clearTimeout(handle)
+  }, [value, delayMs])
+  return debounced
 }
 
 function Card({ className = '', children }) {
@@ -164,7 +176,8 @@ function MemoryList({ view, api, onOpen }) {
   const listQuery = useQuery({
     queryKey: [PLUGIN_ID, 'list', view],
     queryFn: () => api.memories(view),
-    enabled: !isSearch
+    enabled: !isSearch,
+    staleTime: 5000
   })
   if (isSearch) return null
   if (listQuery.isLoading) return jsx(Skeleton, { className: 'h-24 w-full' })
@@ -187,7 +200,8 @@ function SearchResults({ query, api, onOpen }) {
   const searchQuery = useQuery({
     queryKey: [PLUGIN_ID, 'search', query],
     queryFn: () => api.search(query),
-    enabled: query.trim().length > 0
+    enabled: query.trim().length > 0,
+    staleTime: 15000
   })
   if (!query.trim()) return null
   if (searchQuery.isLoading) return jsx(Skeleton, { className: 'h-16 w-full' })
@@ -204,7 +218,12 @@ function SearchResults({ query, api, onOpen }) {
 }
 
 function DetailActions({ item, api, queryClient }) {
-  const invalidate = () => queryClient.invalidateQueries({ queryKey: [PLUGIN_ID] })
+  const invalidate = () => {
+    queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'state'] })
+    queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'list'] })
+    queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'search'] })
+    queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'detail', item.id] })
+  }
   const [confirmDisable, setConfirmDisable] = useState(false)
   const [actionError, setActionError] = useState(null)
   const onError = error => setActionError(error instanceof Error ? error.message : String(error))
@@ -245,7 +264,8 @@ function MemoryDetail({ memoryId, api }) {
   const detailQuery = useQuery({
     queryKey: [PLUGIN_ID, 'detail', memoryId],
     queryFn: () => api.detail(memoryId),
-    enabled: Boolean(memoryId)
+    enabled: Boolean(memoryId),
+    staleTime: 5000
   })
   if (!memoryId) return null
   if (detailQuery.isLoading) return jsx(Skeleton, { className: 'h-32 w-full' })
@@ -334,8 +354,13 @@ function MemcorePage({ ctx }) {
   const [view, setView] = useState('candidate')
   const [query, setQuery] = useState('')
   const [openId, setOpenId] = useState(null)
-  const projectsQuery = useQuery({ queryKey: [PLUGIN_ID, 'projects'], queryFn: () => api.projects() })
-  const stateQuery = useQuery({ queryKey: [PLUGIN_ID, 'state'], queryFn: () => api.state() })
+  const normalizedQuery = query.trim()
+  const debouncedQuery = useDebouncedValue(normalizedQuery)
+  const stateQuery = useQuery({
+    queryKey: [PLUGIN_ID, 'state'],
+    queryFn: () => api.state(),
+    staleTime: 5000
+  })
   const counts = stateQuery.data?.counts || {}
   return jsx('div', {
     className: 'mx-auto flex w-full flex-col gap-4 p-4',
@@ -370,20 +395,18 @@ function MemcorePage({ ctx }) {
           className: 'flex flex-wrap items-center gap-2',
           children: VIEWS.map(v => jsx(Button, {
             key: v.key,
-            variant: view === v.key && !query ? 'default' : 'ghost',
+            variant: view === v.key && !normalizedQuery ? 'default' : 'ghost',
             size: 'sm',
             onClick: () => { setView(v.key); setQuery('') },
             children: v.label
           }, v.key))
         }),
-        query.trim()
-          ? jsx(SearchResults, { query, api, onOpen: setOpenId })
+        normalizedQuery
+          ? debouncedQuery
+            ? jsx(SearchResults, { query: debouncedQuery, api, onOpen: setOpenId })
+            : jsx(Skeleton, { className: 'h-16 w-full' })
           : jsx(MemoryList, { view, api, onOpen: setOpenId }),
-        jsx(MemoryDetail, { memoryId: openId, api }),
-        projectsQuery.data ? jsx('p', {
-          className: 'text-xs', style: FAINT,
-          children: `projects: ${projectsQuery.data.projects.map(p => p.name).join(', ')}`
-        }) : null
+        jsx(MemoryDetail, { memoryId: openId, api })
       ]
     })
   })

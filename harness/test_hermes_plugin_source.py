@@ -41,6 +41,17 @@ class HermesPluginSourceTests(unittest.TestCase):
         self.assertEqual(manifest['version'], version)
         self.assertIn(f"version: '{version}'", desktop)
 
+    def test_desktop_avoids_search_and_cache_request_churn(self):
+        desktop = (PLUGIN_ROOT / 'desktop' / 'plugin.js').read_text(encoding='utf-8')
+        self.assertIn('function useDebouncedValue', desktop)
+        self.assertIn('clearTimeout(handle)', desktop)
+        self.assertIn('staleTime: 15000', desktop)
+        self.assertNotIn("queryKey: [PLUGIN_ID, 'projects']", desktop)
+        self.assertNotIn("projects: () => get('/projects')", desktop)
+        self.assertNotIn(
+            "invalidateQueries({ queryKey: [PLUGIN_ID] })", desktop
+        )
+
     def test_source_has_no_machine_specific_absolute_checkout(self):
         for relative in ('plugin.py', 'native_provider.py', 'dashboard/plugin_api.py'):
             text = (PLUGIN_ROOT / pathlib.PurePosixPath(relative)).read_text(encoding='utf-8')

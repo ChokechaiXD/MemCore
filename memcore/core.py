@@ -648,7 +648,7 @@ def visible_memories(conn, project_id, agent_id, include_disabled=False,
         'WHERE m.project_id = ? '
         "  AND (m.scope = 'project' OR m.owner_agent_id = ?) "
         f'  AND m.lifecycle NOT IN ({", ".join(excluded)}) '
-        'ORDER BY m.pinned DESC, datetime(m.updated_at) DESC, m.id ASC',
+        'ORDER BY m.pinned DESC, m.updated_at DESC, m.id ASC',
         (project_id, agent_id)
     )
     return cur.fetchall()
@@ -724,7 +724,7 @@ def search(conn, project_id, agent_id, query, limit=20):
             "CASE m.lifecycle WHEN 'accepted' THEN 0 WHEN 'conflict' THEN 1 ELSE 2 END, " +
             "CASE m.verification WHEN 'user_authoritative' THEN 0 WHEN 'runtime_verified' THEN 1 WHEN 'source_backed' THEN 2 ELSE 3 END, " +
             "CASE m.freshness WHEN 'current' THEN 0 WHEN 'aging' THEN 1 ELSE 2 END, " +
-            'datetime(m.updated_at) DESC, m.id ASC LIMIT ?',
+            'm.updated_at DESC, m.id ASC LIMIT ?',
             (project_id, agent_id, raw_query, limit)
         ).fetchall()
         if rows:
@@ -748,7 +748,7 @@ def search(conn, project_id, agent_id, query, limit=20):
         "CASE m.lifecycle WHEN 'accepted' THEN 0 WHEN 'conflict' THEN 1 ELSE 2 END, " +
         "CASE m.verification WHEN 'user_authoritative' THEN 0 WHEN 'runtime_verified' THEN 1 WHEN 'source_backed' THEN 2 ELSE 3 END, " +
         "CASE m.freshness WHEN 'current' THEN 0 WHEN 'aging' THEN 1 ELSE 2 END, " +
-        'rank ASC, datetime(m.updated_at) DESC, m.id ASC LIMIT ?',
+        'rank ASC, m.updated_at DESC, m.id ASC LIMIT ?',
         (match_expr, project_id, agent_id, limit)
     )
     return cur.fetchall()
@@ -764,7 +764,7 @@ def conflict_memories(conn, project_id, agent_id):
         'JOIN memory_version v ON v.id = m.current_version_id '
         "WHERE m.project_id = ? AND m.lifecycle = 'conflict' "
         "  AND (m.scope='project' OR m.owner_agent_id=?) "
-        'ORDER BY datetime(m.updated_at) DESC, m.id ASC',
+        'ORDER BY m.updated_at DESC, m.id ASC',
         (project_id, agent_id)
     )
     return cur.fetchall()
@@ -779,7 +779,7 @@ def superseded_history(conn, memory_id, agent_id):
         '  AND EXISTS (SELECT 1 FROM project_membership pm '
         '              WHERE pm.project_id=m.project_id AND pm.agent_id=?) '
         "  AND (m.scope='project' OR m.owner_agent_id=?) "
-        'ORDER BY datetime(v.created_at), v.rowid',
+        'ORDER BY v.created_at ASC, v.rowid ASC',
         (memory_id, agent_id, agent_id)
     )
     return cur.fetchall()
@@ -969,24 +969,42 @@ def _import_item_summary(item):
 
 
 def _claim_already_present(conn, project_id, claim_fp, scope='project', agent_id=None):
-    """Check current non-rejected memories in the same visibility scope."""
+    """Check current non-rejected memories using the indexed claim fingerprint.
+
+    Migration 0010 backfilled fingerprints and engine writes maintain them. A
+    narrow legacy fallback scans only externally inserted rows whose fingerprint
+    is still NULL, preserving compatibility without rescanning the whole scope.
+    """
     if scope not in ('project', 'private'):
         raise MemCoreError(f'invalid scope: {scope}')
     sql = (
-        'SELECT v.content FROM memory m '
-        'JOIN memory_version v ON v.id=m.current_version_id '
-        'WHERE m.project_id=? AND m.scope=? AND m.lifecycle != \'rejected\' '
+        'SELECT 1 FROM memory m '
+        'WHERE m.project_id=? AND m.scope=? AND m.claim_fingerprint=? '
+        "AND m.lifecycle != 'rejected' "
     )
-    args = [project_id, scope]
+    args = [project_id, scope, claim_fp]
     if scope == 'private':
         if not agent_id:
             raise MemCoreError('agent_id is required when planning private import')
         sql += 'AND m.owner_agent_id=? '
         args.append(agent_id)
-    for (content,) in conn.execute(sql, args):
-        if fingerprint(content) == claim_fp:
-            return True
-    return False
+    if conn.execute(sql + 'LIMIT 1', args).fetchone():
+        return True
+
+    legacy_sql = (
+        'SELECT v.content FROM memory m '
+        'JOIN memory_version v ON v.id=m.current_version_id '
+        'WHERE m.project_id=? AND m.scope=? AND m.claim_fingerprint IS NULL '
+        "AND m.lifecycle != 'rejected' "
+    )
+    legacy_args = [project_id, scope]
+    if scope == 'private':
+        legacy_sql += 'AND m.owner_agent_id=? '
+        legacy_args.append(agent_id)
+    return any(
+        fingerprint(content) == claim_fp
+        for (content,) in conn.execute(legacy_sql, legacy_args)
+    )
 
 
 def _import_idempotency_key(project_id, claim_fp, scope='project', agent_id=None):

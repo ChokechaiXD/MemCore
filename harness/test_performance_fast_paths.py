@@ -31,8 +31,8 @@ class PerformanceFastPathTests(unittest.TestCase):
         self.conn.close()
         self.tmp.cleanup()
 
-    def test_schema_0010_installs_fast_path_indexes(self):
-        self.assertEqual(store.MIGRATIONS[-1][0], '0010_performance_fast_paths')
+    def test_schema_installs_fast_path_indexes(self):
+        self.assertEqual(store.MIGRATIONS[-1][0], '0011_performance_round2')
         memory_indexes = {
             row[1] for row in self.conn.execute("PRAGMA index_list('memory')").fetchall()
         }
@@ -46,6 +46,7 @@ class PerformanceFastPathTests(unittest.TestCase):
             row[1] for row in self.conn.execute("PRAGMA index_list('audit_event')").fetchall()
         }
         self.assertIn('idx_memory_private_claim', memory_indexes)
+        self.assertIn('idx_memory_project_claim', memory_indexes)
         self.assertIn('idx_ingest_event_pending_decision', ingest_indexes)
         self.assertIn('idx_ingest_derivation_memory_event', derivation_indexes)
         self.assertIn('idx_audit_mutation_recovery', audit_indexes)
@@ -65,7 +66,7 @@ class PerformanceFastPathTests(unittest.TestCase):
             conn.execute(
                 "INSERT INTO schema_migrations (version) VALUES ('0001_initial_contract')"
             )
-            for name, sql in store.MIGRATIONS[1:-1]:
+            for name, sql in store.MIGRATIONS[1:-2]:
                 store._apply_migration(conn, name, sql)
             conn.execute("INSERT INTO project (id,name) VALUES ('p','legacy')")
             conn.execute(
@@ -96,7 +97,7 @@ class PerformanceFastPathTests(unittest.TestCase):
                 upgraded.execute('SELECT claim_fingerprint FROM memory WHERE id=\'m\'').fetchone()[0],
                 core.fingerprint('Legacy durable claim')
             )
-            self.assertEqual(store._current_version(upgraded), '0010_performance_fast_paths')
+            self.assertEqual(store._current_version(upgraded), '0011_performance_round2')
         finally:
             upgraded.close()
 
@@ -138,6 +139,35 @@ class PerformanceFastPathTests(unittest.TestCase):
             ('proj', 'agent', target_fp)
         ).fetchall()
         self.assertIn('idx_memory_private_claim', ' '.join(str(row) for row in plan))
+
+    def test_import_claim_lookup_uses_project_fingerprint_index_without_rescan(self):
+        for index in range(80):
+            core.create_memory(
+                self.conn, 'proj', 'agent', f'project import claim {index}', scope='project'
+            )
+        target_fp = core.fingerprint('project import claim 57')
+        with mock.patch.object(core, 'fingerprint', side_effect=AssertionError('slow scan')):
+            self.assertTrue(
+                core._claim_already_present(self.conn, 'proj', target_fp, scope='project')
+            )
+        plan = self.conn.execute(
+            "EXPLAIN QUERY PLAN SELECT 1 FROM memory m "
+            "WHERE m.project_id=? AND m.scope=? AND m.claim_fingerprint=? "
+            "AND m.lifecycle != 'rejected' LIMIT 1",
+            ('proj', 'project', target_fp)
+        ).fetchall()
+        self.assertIn('idx_memory_project_claim', ' '.join(str(row) for row in plan))
+
+    def test_import_claim_lookup_scans_only_legacy_null_fingerprints(self):
+        memory_id, _ = core.create_memory(
+            self.conn, 'proj', 'agent', 'legacy import claim', scope='project'
+        )
+        self.conn.execute(
+            'UPDATE memory SET claim_fingerprint=NULL WHERE id=?', (memory_id,)
+        )
+        self.assertTrue(core._claim_already_present(
+            self.conn, 'proj', core.fingerprint('legacy import claim'), scope='project'
+        ))
 
     def test_semantic_queue_query_uses_partial_index(self):
         event_id, _ = ingest.append_event(
