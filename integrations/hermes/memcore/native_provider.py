@@ -10,6 +10,7 @@ import importlib.util
 import json
 import logging
 import pathlib
+import time
 from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider, RecallStatus
@@ -51,6 +52,10 @@ class MemCoreMemoryProvider(MemoryProvider):
         self._semantic_auto_enabled = False
         self._semantic_max_events = 1
         self._semantic_analyzer = None
+        self._semantic_failure_threshold = 2
+        self._semantic_cooldown_seconds = 60.0
+        self._semantic_consecutive_failures = 0
+        self._semantic_circuit_open_until = 0.0
         self._last_recall_count = 0
 
     @property
@@ -84,6 +89,10 @@ class MemCoreMemoryProvider(MemoryProvider):
         self._semantic_auto_enabled = False
         self._semantic_analyzer = None
         self._semantic_max_events = 1
+        self._semantic_failure_threshold = 2
+        self._semantic_cooldown_seconds = 60.0
+        self._semantic_consecutive_failures = 0
+        self._semantic_circuit_open_until = 0.0
         semantic_cfg = cfg.get('semantic') or {}
         auto_cfg = semantic_cfg.get('auto_review') or {}
         enabled = auto_cfg.get('enabled', False)
@@ -104,10 +113,20 @@ class MemCoreMemoryProvider(MemoryProvider):
             timeout_seconds = auto_cfg.get('timeout_seconds', 30.0)
             max_input_chars = auto_cfg.get('max_input_chars', 6000)
             min_confidence = auto_cfg.get('min_remember_confidence', 0.85)
+            failure_threshold = auto_cfg.get('failure_threshold', 2)
+            cooldown_seconds = auto_cfg.get('cooldown_seconds', 60.0)
             if isinstance(max_events, bool) or not isinstance(max_events, int):
                 raise ValueError('max_events_per_turn must be an integer')
             if not 1 <= max_events <= 5:
                 raise ValueError('max_events_per_turn must be between 1 and 5')
+            if isinstance(failure_threshold, bool) or not isinstance(failure_threshold, int):
+                raise ValueError('failure_threshold must be an integer')
+            if not 1 <= failure_threshold <= 10:
+                raise ValueError('failure_threshold must be between 1 and 10')
+            if isinstance(cooldown_seconds, bool) or not isinstance(cooldown_seconds, (int, float)):
+                raise ValueError('cooldown_seconds must be numeric')
+            if not 1.0 <= float(cooldown_seconds) <= 3600.0:
+                raise ValueError('cooldown_seconds must be between 1 and 3600')
             self._semantic_analyzer = HermesSemanticAnalyzer(
                 self._plugin_llm,
                 max_tokens=max_tokens,
@@ -116,20 +135,31 @@ class MemCoreMemoryProvider(MemoryProvider):
                 min_remember_confidence=min_confidence,
             )
             self._semantic_max_events = max_events
+            self._semantic_failure_threshold = failure_threshold
+            self._semantic_cooldown_seconds = float(cooldown_seconds)
             self._semantic_auto_enabled = True
         except (TypeError, ValueError) as exc:
             logger.warning('MemCore semantic auto-review config invalid; disabled: %s', exc)
 
-    def _run_auto_semantic_review(self, conn, trigger_event_id=None):
-        """Review a bounded queue slice on Hermes' existing background sync worker."""
+    def _record_semantic_failure(self):
+        self._semantic_consecutive_failures += 1
+        if self._semantic_consecutive_failures >= self._semantic_failure_threshold:
+            self._semantic_circuit_open_until = (
+                time.monotonic() + self._semantic_cooldown_seconds
+            )
+            logger.warning(
+                'MemCore semantic auto-review circuit opened after %d consecutive failures; '
+                'cooldown %.0fs',
+                self._semantic_consecutive_failures, self._semantic_cooldown_seconds
+            )
+
+    def _run_auto_semantic_review(self, conn):
+        """Review one bounded queue slice with a local failure circuit breaker."""
         if not self._semantic_auto_enabled or self._semantic_analyzer is None:
             return None
-        if trigger_event_id:
-            row = conn.execute(
-                'SELECT event_type FROM ingest_event WHERE id=?', (trigger_event_id,)
-            ).fetchone()
-            if row is None or row[0] != 'turn':
-                return None
+        if time.monotonic() < self._semantic_circuit_open_until:
+            logger.debug('MemCore semantic auto-review skipped while circuit is open')
+            return {'skipped': 'circuit_open'}
         try:
             result = semantic.analyze_pending_events(
                 conn,
@@ -151,9 +181,17 @@ class MemCoreMemoryProvider(MemoryProvider):
                     'MemCore semantic auto-review examined=%d succeeded=%d failed=%d',
                     result['examined'], result['succeeded'], result['failed']
                 )
+            if result['failed']:
+                if result['succeeded']:
+                    self._semantic_consecutive_failures = 0
+                self._record_semantic_failure()
+            elif result['succeeded']:
+                self._semantic_consecutive_failures = 0
+                self._semantic_circuit_open_until = 0.0
             return result
         except Exception as exc:
             # Never turn a model/provider outage into a memory-provider failure.
+            self._record_semantic_failure()
             logger.warning('MemCore semantic auto-review failed closed: %s', exc)
             return None
 
@@ -210,9 +248,12 @@ class MemCoreMemoryProvider(MemoryProvider):
         pinned_ids = {row[0] for row in pinned}
         hits = []
         if query.strip():
+            # core.search ranks matching pinned rows first. Over-fetch only by
+            # the number of globally pinned rows we may remove, rather than a
+            # fixed 50-row batch on every recall.
             raw = core.search(
                 conn, self._project_id, self._agent_id, query,
-                limit=max(50, self._max_items * 5)
+                limit=min(500, self._max_items + len(pinned))
             )
             hits = [row for row in raw if row[0] not in pinned_ids]
         return pinned, hits
@@ -221,7 +262,7 @@ class MemCoreMemoryProvider(MemoryProvider):
         self._last_recall_count = 0
         if not query or self._budget <= 0 or self._max_items <= 0:
             return ''
-        conn = store.open_store_readonly(self._store_path)
+        conn = store.open_runtime_store_readonly(self._store_path)
         try:
             pinned, hits = self._recall_rows(conn, query)
             block = agent_plugin.build_recall_block(
@@ -250,7 +291,7 @@ class MemCoreMemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *,
                   session_id: str = '', messages=None) -> None:
-        conn = store.open_store(self._store_path)
+        conn = store.open_runtime_store(self._store_path)
         try:
             event_id, _created = ingest.append_event(
                 conn, self._project_id, self._agent_id, 'turn',
@@ -260,7 +301,7 @@ class MemCoreMemoryProvider(MemoryProvider):
                 metadata=self._event_metadata(messages)
             )
             ingest.process_event(conn, event_id)
-            self._run_auto_semantic_review(conn, event_id)
+            self._run_auto_semantic_review(conn)
         finally:
             conn.close()
 
@@ -272,7 +313,7 @@ class MemCoreMemoryProvider(MemoryProvider):
         # identify the deleted entry via metadata.old_text.
         if not content and action != 'remove':
             return
-        conn = store.open_store(self._store_path)
+        conn = store.open_runtime_store(self._store_path)
         try:
             event_id, _created = ingest.append_event(
                 conn, self._project_id, self._agent_id, 'memory_write',
@@ -289,7 +330,7 @@ class MemCoreMemoryProvider(MemoryProvider):
     def on_delegation(self, task: str, result: str, *, child_session_id: str = '', **kwargs):
         if not task and not result:
             return
-        conn = store.open_store(self._store_path)
+        conn = store.open_runtime_store(self._store_path)
         try:
             ingest.append_event(
                 conn, self._project_id, self._agent_id, 'delegation',
@@ -351,7 +392,7 @@ class MemCoreMemoryProvider(MemoryProvider):
         ]
 
     def _handle_semantic_tool_call(self, tool_name: str, args: Dict[str, Any]) -> str:
-        conn = store.open_store(self._store_path)
+        conn = store.open_runtime_store(self._store_path)
         try:
             if tool_name == 'memory_review_queue':
                 limit = args.get('limit', 10)

@@ -15,7 +15,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from memcore import store, core
 
 
+def _percentile(sorted_values, percentile):
+    index = max(0, min(len(sorted_values) - 1,
+                       int(round((len(sorted_values) - 1) * percentile))))
+    return sorted_values[index]
+
+
 def main():
+    random.seed(1337)
     # Create a scratch directory for the temp DB
     tmpdir = tempfile.mkdtemp(prefix='memcore_bench_')
     db_path = os.path.join(tmpdir, 'bench.db')
@@ -66,8 +73,8 @@ def main():
         times.append(elapsed)
     
     times.sort()
-    p50 = times[50]  # median of 1000
-    p95 = times[949]  # 95th percentile
+    p50 = _percentile(times, 0.50)
+    p95 = _percentile(times, 0.95)
     
     conn.close()
     

@@ -174,7 +174,7 @@ class JournalCliTests(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             cli.main(['--db', self.db, 'stats'])
         stats = json.loads(output.getvalue())
-        self.assertEqual(stats['schema_version'], '0009_semantic_analysis')
+        self.assertEqual(stats['schema_version'], '0010_performance_fast_paths')
         self.assertEqual(stats['journal']['semantic_review_pending'], 1)
         self.assertEqual(stats['journal']['health'], 'review_pending')
 

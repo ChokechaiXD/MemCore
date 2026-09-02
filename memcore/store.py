@@ -4,6 +4,7 @@ MemCore — storage layer.
 open_store(): apply schema, run pending migrations under a lock, set pragmas.
 All operations use short transactions and WAL + busy_timeout.
 """
+import hashlib
 import os
 import sqlite3
 import pathlib
@@ -215,6 +216,19 @@ END;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_project_name_unique ON project(name);
 """
 
+_PERFORMANCE_FAST_PATHS = """
+ALTER TABLE memory ADD COLUMN claim_fingerprint TEXT;
+CREATE INDEX IF NOT EXISTS idx_memory_private_claim
+ON memory(project_id, owner_agent_id, scope, claim_fingerprint, lifecycle);
+CREATE INDEX IF NOT EXISTS idx_ingest_event_pending_decision
+ON ingest_event(project_id, agent_id, decision, created_at, id)
+WHERE status='pending';
+CREATE INDEX IF NOT EXISTS idx_ingest_derivation_memory_event
+ON ingest_derivation(memory_id, event_id);
+CREATE INDEX IF NOT EXISTS idx_audit_mutation_recovery
+ON audit_event(project_id, actor_agent_id, action, id DESC);
+"""
+
 MIGRATIONS = [
     ('0001_initial_contract', None),  # None = apply schema.sql verbatim
     ('0002_fts_sync_triggers', _FTS_TRIGGERS),
@@ -238,6 +252,7 @@ CREATE INDEX IF NOT EXISTS idx_tombstone_fingerprint ON tombstone(claim_fingerpr
     ('0007_integrity_hardening', _INTEGRITY_HARDENING),
     ('0008_ingest_journal', _INGEST_JOURNAL),
     ('0009_semantic_analysis', _SEMANTIC_ANALYSIS),
+    ('0010_performance_fast_paths', _PERFORMANCE_FAST_PATHS),
 ]
 
 
@@ -302,17 +317,52 @@ def open_store(db_path: str, check_same_thread: bool = True) -> sqlite3.Connecti
         raise
 
 
-def open_store_readonly(db_path: str) -> sqlite3.Connection:
-    """Open an existing, current MemCore store without schema/domain writes."""
+def _open_existing_connection(db_path: str, *, readonly: bool,
+                              check_same_thread: bool = True) -> sqlite3.Connection:
+    """Open an existing store without WAL negotiation or migration work.
+
+    This is the hot-path opener for a long-running provider after ``open_store``
+    has already completed bootstrap/migrations during initialization. ``mode=rw``
+    and ``mode=ro`` both fail if the database disappears, so runtime calls never
+    create an accidental empty store.
+    """
     p = pathlib.Path(db_path).expanduser().resolve()
     if not p.is_file():
         raise StoreError(f'store does not exist: {p}')
-    conn = sqlite3.connect(p.as_uri() + '?mode=ro', uri=True, timeout=10,
-                           isolation_level=None)
+    mode = 'ro' if readonly else 'rw'
+    conn = sqlite3.connect(
+        p.as_uri() + f'?mode={mode}', uri=True, timeout=10,
+        isolation_level=None, check_same_thread=check_same_thread
+    )
     try:
         conn.execute('PRAGMA busy_timeout = 5000')
         conn.execute('PRAGMA foreign_keys = ON')
-        conn.execute('PRAGMA query_only = ON')
+        if readonly:
+            conn.execute('PRAGMA query_only = ON')
+        else:
+            conn.execute('PRAGMA synchronous = NORMAL')
+        return conn
+    except Exception:
+        conn.close()
+        raise
+
+
+def open_runtime_store(db_path: str, check_same_thread: bool = True) -> sqlite3.Connection:
+    """Fast writable opener; requires a store already bootstrapped by ``open_store``."""
+    return _open_existing_connection(
+        db_path, readonly=False, check_same_thread=check_same_thread
+    )
+
+
+def open_runtime_store_readonly(db_path: str) -> sqlite3.Connection:
+    """Fast read-only opener for a store validated during provider initialization."""
+    return _open_existing_connection(db_path, readonly=True)
+
+
+def open_store_readonly(db_path: str) -> sqlite3.Connection:
+    """Open an existing, current MemCore store without schema/domain writes."""
+    conn = _open_existing_connection(db_path, readonly=True)
+    try:
         current = _current_version(conn)
         expected = MIGRATIONS[-1][0]
         if current != expected:
@@ -482,6 +532,24 @@ def _script_statements(sql):
         raise StoreError('incomplete SQL statement in migration')
 
 
+def _backfill_current_fingerprints(conn):
+    """Populate the indexed fingerprint for memories created before migration 0010."""
+    rows = conn.execute(
+        'SELECT m.id, v.content FROM memory m '
+        'JOIN memory_version v ON v.id=m.current_version_id '
+        'WHERE m.claim_fingerprint IS NULL'
+    ).fetchall()
+    updates = []
+    for memory_id, content in rows:
+        normalized = ' '.join(str(content or '').lower().strip().split())
+        claim_fp = hashlib.sha256(normalized.encode()).hexdigest()[:16]
+        updates.append((claim_fp, memory_id))
+    if updates:
+        conn.executemany(
+            'UPDATE memory SET claim_fingerprint=? WHERE id=?', updates
+        )
+
+
 def _apply_migration(conn, name, sql):
     """Apply one migration and its bookkeeping safely.
 
@@ -512,6 +580,8 @@ def _apply_migration(conn, name, sql):
                 return
             for stmt in _script_statements(sql):
                 conn.execute(stmt)
+            if name == '0010_performance_fast_paths':
+                _backfill_current_fingerprints(conn)
             if rebuild_fk:
                 violations = conn.execute('PRAGMA foreign_key_check').fetchall()
                 if violations:

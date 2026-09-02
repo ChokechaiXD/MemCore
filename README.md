@@ -7,7 +7,7 @@
 **Persistent memory without turning raw conversation history into trusted truth.**
 
 [![Status](https://img.shields.io/badge/status-active-success?style=for-the-badge)](https://github.com/ChokechaiXD/MemCore)
-[![Tests](https://img.shields.io/badge/tests-202%20%7C%20gate%20OK-brightgreen?style=for-the-badge)](https://github.com/ChokechaiXD/MemCore)
+[![Tests](https://img.shields.io/badge/tests-208%20%7C%20gate%20OK-brightgreen?style=for-the-badge)](https://github.com/ChokechaiXD/MemCore)
 [![SQLite](https://img.shields.io/badge/storage-SQLite%20%7C%20WAL%20%7C%20FTS5-07405E?style=for-the-badge&logo=sqlite&logoColor=white)](https://sqlite.org/)
 [![Hermes](https://img.shields.io/badge/Hermes-native%20provider-7B61FF?style=for-the-badge)](https://github.com/NousResearch/hermes-agent)
 
@@ -147,7 +147,7 @@ accepted/conflict/candidate ──► superseded ──► new immutable version
 
 ## 🔬 Semantic review
 
-Schema revision `0009_semantic_analysis` adds an auditable review boundary for ambiguous journal events.
+Schema revision `0009_semantic_analysis` adds an auditable review boundary for ambiguous journal events. Migration `0010_performance_fast_paths` adds indexed current-claim fingerprints, a partial semantic-review queue index, and runtime connection fast paths without changing governance semantics.
 
 An external analyzer receives only an event awaiting semantic review and can return one of three verdicts:
 
@@ -401,7 +401,7 @@ There is no mandatory vector database, no memory daemon, and no hidden backgroun
 Current migration head:
 
 ```text
-0009_semantic_analysis
+0010_performance_fast_paths
 ```
 
 ---
@@ -425,6 +425,7 @@ Current migration head:
 | Journal operations / health CLI | ✅ Implemented |
 | Provider-agnostic automatic semantic analyzer adapter | ✅ Implemented |
 | Hermes host-LLM automatic semantic review | ✅ Implemented (opt-in) |
+| Indexed runtime performance fast paths + reviewer circuit breaker | ✅ Implemented |
 
 ---
 

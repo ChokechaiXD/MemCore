@@ -83,6 +83,8 @@ class NativeProviderTest(unittest.TestCase):
             'timeout_seconds': 10.0,
             'max_input_chars': 4000,
             'min_remember_confidence': 0.85,
+            'failure_threshold': 2,
+            'cooldown_seconds': 60.0,
         }
         auto.update(overrides)
         config['plugins']['entries']['memcore']['settings']['semantic'] = {
@@ -240,6 +242,50 @@ class NativeProviderTest(unittest.TestCase):
             self.assertEqual(conn.execute('SELECT COUNT(*) FROM ingest_analysis').fetchone()[0], 0)
         finally:
             conn.close()
+
+    def test_auto_semantic_review_circuit_breaker_suppresses_repeated_failures(self):
+        llm = FakePluginLlm(error=RuntimeError('host model unavailable'))
+        p = self.auto_provider(
+            llm, failure_threshold=2, cooldown_seconds=60.0,
+            max_events_per_turn=1
+        )
+        for index in range(3):
+            p.sync_turn(
+                f'Ambiguous durable detail during outage {index}.',
+                'Acknowledged.', session_id=f'circuit-{index}'
+            )
+        self.assertEqual(len(llm.calls), 2)
+        self.assertGreater(p._semantic_circuit_open_until, 0.0)
+        conn = store.open_store(self.db)
+        try:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM ingest_event "
+                "WHERE decision='semantic_review_required' AND status='pending'"
+            ).fetchone()[0], 3)
+        finally:
+            conn.close()
+
+    def test_auto_semantic_review_circuit_half_open_probe_recovers(self):
+        llm = FakePluginLlm(error=RuntimeError('host model unavailable'))
+        p = self.auto_provider(llm, failure_threshold=1, cooldown_seconds=60.0)
+        p.sync_turn(
+            'Ambiguous durable detail while backend is offline.',
+            'Acknowledged.', session_id='circuit-open'
+        )
+        self.assertEqual(len(llm.calls), 1)
+        self.assertGreater(p._semantic_circuit_open_until, 0.0)
+
+        # Simulate cooldown expiry and backend recovery. One probe is allowed;
+        # a successful result closes the circuit and clears failure history.
+        p._semantic_circuit_open_until = 0.0
+        llm.error = None
+        p.sync_turn(
+            'Another ambiguous durable detail after backend recovery.',
+            'Acknowledged.', session_id='circuit-recover'
+        )
+        self.assertEqual(len(llm.calls), 2)
+        self.assertEqual(p._semantic_consecutive_failures, 0)
+        self.assertEqual(p._semantic_circuit_open_until, 0.0)
 
     def test_auto_semantic_review_is_opt_in(self):
         llm = FakePluginLlm()

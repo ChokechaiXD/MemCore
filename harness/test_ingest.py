@@ -42,7 +42,7 @@ class TestIngestJournal(IngestTestBase):
         self.assertIn('ingest_event', names)
         self.assertIn('ingest_derivation', names)
         self.assertIn('ingest_analysis', names)
-        self.assertEqual(store.MIGRATIONS[-1][0], '0009_semantic_analysis')
+        self.assertEqual(store.MIGRATIONS[-1][0], '0010_performance_fast_paths')
 
     def test_append_is_retry_safe(self):
         kwargs = dict(
@@ -215,6 +215,11 @@ class TestIngestJournal(IngestTestBase):
         self.assertEqual(result['status'], 'processed')
         self.assertEqual(result['decision'], 'builtin_memory_replaced')
         self.assertEqual(result['memory_id'], added['memory_id'])
+        audit_write_key = self.conn.execute(
+            "SELECT write_key FROM audit_event WHERE action='supersede' AND memory_id=?",
+            (added['memory_id'],)
+        ).fetchone()[0]
+        self.assertEqual(audit_write_key, f'ingest:{event_id}')
         row = self.conn.execute(
             'SELECT m.lifecycle, v.content FROM memory m JOIN memory_version v '
             'ON v.id=m.current_version_id WHERE m.id=?', (added['memory_id'],)

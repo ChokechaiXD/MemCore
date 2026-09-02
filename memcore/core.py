@@ -117,6 +117,31 @@ def _require_membership(conn, project_id, agent_id):
     return role
 
 
+def _current_claim_identity(conn, memory_id):
+    """Return (current_version_id, fingerprint), lazily repairing legacy NULLs."""
+    row = conn.execute(
+        'SELECT current_version_id, claim_fingerprint FROM memory WHERE id=?',
+        (memory_id,)
+    ).fetchone()
+    if row is None:
+        raise NotFound(f'memory {memory_id} not found')
+    version_id, claim_fp = row
+    if claim_fp:
+        return version_id, claim_fp
+    content_row = conn.execute(
+        'SELECT content FROM memory_version WHERE id=?', (version_id,)
+    ).fetchone()
+    if content_row is None:
+        raise MemCoreError(f'current version {version_id} is missing for memory {memory_id}')
+    claim_fp = fingerprint(content_row[0])
+    conn.execute(
+        'UPDATE memory SET claim_fingerprint=? '
+        'WHERE id=? AND claim_fingerprint IS NULL',
+        (claim_fp, memory_id)
+    )
+    return version_id, claim_fp
+
+
 def _require_memory_write_access(conn, memory_id, agent_id):
     """Return metadata only when the caller is a member of the memory project.
 
@@ -228,10 +253,11 @@ def create_memory(conn, project_id, agent_id, content, scope='private',
         now = _now()
         conn.execute(
             'INSERT INTO memory (id, project_id, scope, owner_agent_id, type, '
-            '  lifecycle, verification, freshness, current_version_id, created_at, updated_at) '
-            "VALUES (?, ?, ?, ?, ?, ?, 'unverified', 'current', ?, ?, ?)",
+            '  lifecycle, verification, freshness, current_version_id, claim_fingerprint, '
+            '  created_at, updated_at) '
+            "VALUES (?, ?, ?, ?, ?, ?, 'unverified', 'current', ?, ?, ?, ?)",
             (mem_id, project_id, scope, agent_id, memory_type,
-             lifecycle, ver_id, now, now)
+             lifecycle, ver_id, claim_fp, now, now)
         )
         conn.execute(
             'INSERT INTO memory_version (id, memory_id, content, reason, '
@@ -260,7 +286,7 @@ def create_memory(conn, project_id, agent_id, content, scope='private',
         raise
 
 
-def supersede(conn, memory_id, agent_id, new_content, reason=None):
+def supersede(conn, memory_id, agent_id, new_content, reason=None, write_key=None):
     """Correct a memory in place while preserving immutable version history.
 
     The old claim receives a scope-appropriate refusal fingerprint, its
@@ -287,13 +313,7 @@ def supersede(conn, memory_id, agent_id, new_content, reason=None):
         if blocked:
             raise TombstoneBlocked(new_fp, blocked[0])
 
-        old_row = conn.execute(
-            'SELECT m.current_version_id, v.content FROM memory m '
-            'JOIN memory_version v ON v.id=m.current_version_id WHERE m.id=?',
-            (memory_id,)
-        ).fetchone()
-        old_ver, old_content = old_row
-        old_fp = fingerprint(old_content)
+        old_ver, old_fp = _current_claim_identity(conn, memory_id)
         if old_fp == new_fp:
             raise MemCoreError('new_content is equivalent to the current claim')
         now = _now()
@@ -316,10 +336,10 @@ def supersede(conn, memory_id, agent_id, new_content, reason=None):
         # A changed claim does not inherit acceptance/verification from the old
         # version. It must earn trust again through feedback/evidence.
         conn.execute(
-            "UPDATE memory SET current_version_id=?, lifecycle='candidate', "
+            "UPDATE memory SET current_version_id=?, claim_fingerprint=?, lifecycle='candidate', "
             "verification='unverified', freshness='current', updated_at=? "
             'WHERE id=?',
-            (new_ver, now, memory_id)
+            (new_ver, new_fp, now, memory_id)
         )
 
         tombstone_created = False
@@ -338,7 +358,7 @@ def supersede(conn, memory_id, agent_id, new_content, reason=None):
                {'new_version_id': new_ver, 'old_version_id': old_ver,
                 'reason': reason, 'old_claim_tombstoned': tombstone_created,
                 'lifecycle_reset': 'candidate',
-                'verification_reset': 'unverified'})
+                'verification_reset': 'unverified'}, write_key=write_key)
         conn.execute('COMMIT')
         return new_ver
     except Exception:
@@ -374,9 +394,7 @@ def promote(conn, memory_id, agent_id):
         project_id, scope, owner, lifecycle, role = _require_memory_write_access(
             conn, memory_id, agent_id
         )
-        current_version_id = conn.execute(
-            'SELECT current_version_id FROM memory WHERE id=?', (memory_id,)
-        ).fetchone()[0]
+        _current_version_id, claim_fp = _current_claim_identity(conn, memory_id)
         if scope != 'private':
             conn.execute('ROLLBACK')
             raise MemCoreError('memory is not private')
@@ -391,15 +409,12 @@ def promote(conn, memory_id, agent_id):
                 f'only the owner or a project owner may promote {memory_id}'
             )
 
-        content = conn.execute(
-            'SELECT content FROM memory_version WHERE id=?', (current_version_id,)
-        ).fetchone()[0]
         blocked = _tombstone_active(
-            conn, fingerprint(content), project_id,
+            conn, claim_fp, project_id,
             scope='private', agent_id=owner
         )
         if blocked:
-            raise TombstoneBlocked(fingerprint(content), blocked[0])
+            raise TombstoneBlocked(claim_fp, blocked[0])
 
         conn.execute(
             "UPDATE memory SET scope='project', updated_at=? WHERE id=?",
@@ -495,7 +510,7 @@ def restore(conn, memory_id, agent_id):
         raise
 
 
-def reject(conn, memory_id, agent_id, reason, create_tombstone=True):
+def reject(conn, memory_id, agent_id, reason, create_tombstone=True, write_key=None):
     """Reject a memory and always leave a refusal fingerprint."""
     if not create_tombstone:
         raise MemCoreError('rejection requires a tombstone refusal guard')
@@ -504,13 +519,7 @@ def reject(conn, memory_id, agent_id, reason, create_tombstone=True):
         project_id, scope, owner, lifecycle, role = _require_memory_write_access(
             conn, memory_id, agent_id
         )
-        cur_ver = conn.execute(
-            'SELECT current_version_id FROM memory WHERE id=?', (memory_id,)
-        ).fetchone()[0]
-        content = conn.execute(
-            'SELECT content FROM memory_version WHERE id=?', (cur_ver,)
-        ).fetchone()[0]
-        claim_fp = fingerprint(content)
+        _cur_ver, claim_fp = _current_claim_identity(conn, memory_id)
 
         if lifecycle == 'rejected':
             if create_tombstone and not _tombstone_active(
@@ -545,7 +554,8 @@ def reject(conn, memory_id, agent_id, reason, create_tombstone=True):
             )
             tombstone_created = True
         _audit(conn, 'reject', agent_id, memory_id, project_id,
-               {'reason': reason, 'tombstoned': tombstone_created})
+               {'reason': reason, 'tombstoned': tombstone_created},
+               write_key=write_key)
         conn.execute('COMMIT')
         return True
     except Exception:
@@ -623,6 +633,8 @@ def visible_memories(conn, project_id, agent_id, include_disabled=False,
       private scope -> owner only
     Excludes rejected/superseded/disabled from 'current truth' by default.
     """
+    if _membership_role(conn, project_id, agent_id) is None:
+        return []
     excluded = ["'superseded'"]
     if not include_rejected:
         excluded.append("'rejected'")
@@ -634,28 +646,26 @@ def visible_memories(conn, project_id, agent_id, include_disabled=False,
         'FROM memory m '
         'JOIN memory_version v ON v.id = m.current_version_id '
         'WHERE m.project_id = ? '
-        '  AND EXISTS (SELECT 1 FROM project_membership pm '
-        '              WHERE pm.project_id = m.project_id AND pm.agent_id = ?) '
         "  AND (m.scope = 'project' OR m.owner_agent_id = ?) "
         f'  AND m.lifecycle NOT IN ({", ".join(excluded)}) '
         'ORDER BY m.pinned DESC, datetime(m.updated_at) DESC, m.id ASC',
-        (project_id, agent_id, agent_id)
+        (project_id, agent_id)
     )
     return cur.fetchall()
 
 
 def private_memories(conn, project_id, agent_id):
     """ONLY this agent's private memories in a project. Others' never appear."""
+    if _membership_role(conn, project_id, agent_id) is None:
+        return []
     cur = conn.execute(
         'SELECT m.id, m.scope, m.owner_agent_id, v.content '
         'FROM memory m '
         'JOIN memory_version v ON v.id = m.current_version_id '
         'WHERE m.project_id = ? '
-        '  AND EXISTS (SELECT 1 FROM project_membership pm '
-        '              WHERE pm.project_id = m.project_id AND pm.agent_id = ?) '
         "  AND m.scope = 'private' "
         '  AND m.owner_agent_id = ?',
-        (project_id, agent_id, agent_id)
+        (project_id, agent_id)
     )
     return cur.fetchall()
 
@@ -699,14 +709,14 @@ def search(conn, project_id, agent_id, query, limit=20):
     raw_query = str(query or '').strip()
     if not raw_query:
         return []
+    if _membership_role(conn, project_id, agent_id) is None:
+        return []
     if any(ord(ch) > 127 for ch in raw_query):
         rows = conn.execute(
             'SELECT m.id, m.scope, m.lifecycle, m.verification, m.freshness, '
             '       v.content, m.owner_agent_id, 0.0 AS rank '
             'FROM memory m JOIN memory_version v ON v.id = m.current_version_id '
             'WHERE m.project_id = ? '
-            '  AND EXISTS (SELECT 1 FROM project_membership pm '
-            '              WHERE pm.project_id = m.project_id AND pm.agent_id = ?) '
             "  AND (m.scope = 'project' OR m.owner_agent_id = ?) "
             "  AND m.lifecycle IN ('candidate', 'accepted', 'conflict') "
             '  AND instr(v.content, ?) > 0 '
@@ -715,7 +725,7 @@ def search(conn, project_id, agent_id, query, limit=20):
             "CASE m.verification WHEN 'user_authoritative' THEN 0 WHEN 'runtime_verified' THEN 1 WHEN 'source_backed' THEN 2 ELSE 3 END, " +
             "CASE m.freshness WHEN 'current' THEN 0 WHEN 'aging' THEN 1 ELSE 2 END, " +
             'datetime(m.updated_at) DESC, m.id ASC LIMIT ?',
-            (project_id, agent_id, agent_id, raw_query, limit)
+            (project_id, agent_id, raw_query, limit)
         ).fetchall()
         if rows:
             return rows
@@ -732,8 +742,6 @@ def search(conn, project_id, agent_id, query, limit=20):
         'WHERE memory_version_fts MATCH ? '
         '  AND v.id = m.current_version_id '
         '  AND m.project_id = ? '
-        '  AND EXISTS (SELECT 1 FROM project_membership pm '
-        '              WHERE pm.project_id = m.project_id AND pm.agent_id = ?) '
         "  AND (m.scope = 'project' OR m.owner_agent_id = ?) "
         "  AND m.lifecycle IN ('candidate', 'accepted', 'conflict') "
         'ORDER BY m.pinned DESC, ' +
@@ -741,23 +749,23 @@ def search(conn, project_id, agent_id, query, limit=20):
         "CASE m.verification WHEN 'user_authoritative' THEN 0 WHEN 'runtime_verified' THEN 1 WHEN 'source_backed' THEN 2 ELSE 3 END, " +
         "CASE m.freshness WHEN 'current' THEN 0 WHEN 'aging' THEN 1 ELSE 2 END, " +
         'rank ASC, datetime(m.updated_at) DESC, m.id ASC LIMIT ?',
-        (match_expr, project_id, agent_id, agent_id, limit)
+        (match_expr, project_id, agent_id, limit)
     )
     return cur.fetchall()
 
 
 def conflict_memories(conn, project_id, agent_id):
     """Readable conflict memories for one member; private scope never leaks."""
+    if _membership_role(conn, project_id, agent_id) is None:
+        return []
     cur = conn.execute(
         'SELECT m.id, m.owner_agent_id, v.content '
         'FROM memory m '
         'JOIN memory_version v ON v.id = m.current_version_id '
         "WHERE m.project_id = ? AND m.lifecycle = 'conflict' "
-        '  AND EXISTS (SELECT 1 FROM project_membership pm '
-        '              WHERE pm.project_id=m.project_id AND pm.agent_id=?) '
         "  AND (m.scope='project' OR m.owner_agent_id=?) "
         'ORDER BY datetime(m.updated_at) DESC, m.id ASC',
-        (project_id, agent_id, agent_id)
+        (project_id, agent_id)
     )
     return cur.fetchall()
 

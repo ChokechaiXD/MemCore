@@ -37,7 +37,7 @@ class HermesPluginSourceTests(unittest.TestCase):
             (PLUGIN_ROOT / 'dashboard' / 'manifest.json').read_text(encoding='utf-8')
         )
         desktop = (PLUGIN_ROOT / 'desktop' / 'plugin.js').read_text(encoding='utf-8')
-        self.assertEqual(version, '0.4.0')
+        self.assertEqual(version, '0.5.0')
         self.assertEqual(manifest['version'], version)
         self.assertIn(f"version: '{version}'", desktop)
 

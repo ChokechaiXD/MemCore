@@ -20,7 +20,7 @@ memcore/
 └── tests/                   # integration regression suite
 ```
 
-Agent, dashboard, and desktop manifests use the same integration version: **0.4.0**.
+Agent, dashboard, and desktop manifests use the same integration version: **0.5.0**.
 
 ## Deploy / verify
 
@@ -80,6 +80,8 @@ plugins:
             timeout_seconds: 30
             max_input_chars: 6000
             min_remember_confidence: 0.85
+            failure_threshold: 2
+            cooldown_seconds: 60
 
 memory:
   provider: memcore
@@ -96,7 +98,10 @@ conversation/tool loop, processes at most `max_events_per_turn`, and only consum
 `semantic_review_required` events. A `defer` result is not automatically retried;
 it remains pending for explicit/manual review. `remember` below
 `min_remember_confidence` is downgraded to `defer`. Provider/model failures leave
-the raw event unchanged and pending.
+the raw event unchanged and pending. After `failure_threshold` consecutive failures,
+the local reviewer circuit opens for `cooldown_seconds`; turns continue normally but
+skip semantic LLM calls until a half-open probe is allowed. This keeps a provider
+outage from adding repeated latency or fallback traffic to every turn.
 
 ## Memory behavior
 

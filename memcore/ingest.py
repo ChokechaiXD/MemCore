@@ -331,18 +331,50 @@ def semantic_analysis_history(conn, event_id, agent_id):
     return results
 
 
-def _find_private_claim(conn, project_id, agent_id, claim_fp):
+def _private_claim_ids(conn, project_id, agent_id, claim_fp, *, active_only=False):
+    """Indexed private-claim lookup with lazy repair for externally inserted legacy rows."""
+    lifecycle_sql = (
+        "m.lifecycle IN ('candidate','accepted','conflict')"
+        if active_only else
+        "m.lifecycle NOT IN ('rejected','disabled','superseded')"
+    )
     rows = conn.execute(
+        'SELECT m.id FROM memory m '
+        "WHERE m.project_id=? AND m.scope='private' AND m.owner_agent_id=? "
+        'AND m.claim_fingerprint=? AND ' + lifecycle_sql,
+        (project_id, agent_id, claim_fp)
+    ).fetchall()
+    matches = [row[0] for row in rows]
+    if matches:
+        return matches
+
+    # Migration 0010 backfills existing stores and all engine writes maintain the
+    # column. This fallback only covers manual/external inserts that omitted it;
+    # repair those rows once so future lookups stay on the indexed fast path.
+    legacy = conn.execute(
         'SELECT m.id, v.content FROM memory m '
         'JOIN memory_version v ON v.id=m.current_version_id '
         "WHERE m.project_id=? AND m.scope='private' AND m.owner_agent_id=? "
-        "AND m.lifecycle NOT IN ('rejected','disabled','superseded')",
+        'AND m.claim_fingerprint IS NULL AND ' + lifecycle_sql,
         (project_id, agent_id)
     ).fetchall()
-    for memory_id, content in rows:
-        if core.fingerprint(content) == claim_fp:
-            return memory_id
-    return None
+    repairs = []
+    for memory_id, content in legacy:
+        current_fp = core.fingerprint(content)
+        repairs.append((current_fp, memory_id))
+        if current_fp == claim_fp:
+            matches.append(memory_id)
+    if repairs:
+        conn.executemany(
+            'UPDATE memory SET claim_fingerprint=? '
+            'WHERE id=? AND claim_fingerprint IS NULL', repairs
+        )
+    return matches
+
+
+def _find_private_claim(conn, project_id, agent_id, claim_fp):
+    matches = _private_claim_ids(conn, project_id, agent_id, claim_fp)
+    return matches[0] if matches else None
 
 
 def _memory_write_reference(metadata):
@@ -374,44 +406,43 @@ def _find_builtin_memory_target(conn, project_id, agent_id, old_text, target='')
     second store can mutate the wrong memory. Uncertain matches remain pending.
     """
     claim_fp = core.fingerprint(old_text)
-    rows = conn.execute(
-        'SELECT m.id, v.content FROM memory m '
-        'JOIN memory_version v ON v.id=m.current_version_id '
-        "WHERE m.project_id=? AND m.scope='private' AND m.owner_agent_id=? "
-        "AND m.lifecycle IN ('candidate','accepted','conflict')",
-        (project_id, agent_id)
+    candidate_ids = _private_claim_ids(
+        conn, project_id, agent_id, claim_fp, active_only=True
+    )
+    if not candidate_ids:
+        return None
+
+    marks = ','.join('?' for _ in candidate_ids)
+    origins = conn.execute(
+        'SELECT d.memory_id, e.metadata FROM ingest_derivation d '
+        'JOIN ingest_event e ON e.id=d.event_id '
+        f"WHERE d.memory_id IN ({marks}) AND e.event_type='memory_write'",
+        candidate_ids
     ).fetchall()
-    matches = []
-    for memory_id, content in rows:
-        if core.fingerprint(content) != claim_fp:
+    matched = set()
+    for memory_id, raw_metadata in origins:
+        if not target:
+            matched.add(memory_id)
             continue
-        origins = conn.execute(
-            'SELECT e.metadata FROM ingest_derivation d '
-            'JOIN ingest_event e ON e.id=d.event_id '
-            "WHERE d.memory_id=? AND e.event_type='memory_write'",
-            (memory_id,)
-        ).fetchall()
-        if not origins:
-            continue
-        if target:
-            target_match = False
-            for (raw_metadata,) in origins:
-                try:
-                    origin = json.loads(raw_metadata or '{}')
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    origin = {}
-                if str(origin.get('target') or '').strip().lower() == target:
-                    target_match = True
-                    break
-            if not target_match:
-                continue
-        matches.append(memory_id)
-    return matches[0] if len(matches) == 1 else None
+        try:
+            origin = json.loads(raw_metadata or '{}')
+        except (TypeError, ValueError, json.JSONDecodeError):
+            origin = {}
+        if str(origin.get('target') or '').strip().lower() == target:
+            matched.add(memory_id)
+    return next(iter(matched)) if len(matched) == 1 else None
 
 
 def _mutation_audit_memory(conn, project_id, agent_id, event_id, action):
     """Recover a mutation that committed before its journal status update."""
     marker = f'ingest:{event_id}'
+    row = conn.execute(
+        'SELECT memory_id FROM audit_event '
+        'WHERE write_key=? AND project_id=? AND actor_agent_id=? AND action=? LIMIT 1',
+        (marker, project_id, agent_id, action)
+    ).fetchone()
+    if row:
+        return row[0]
     rows = conn.execute(
         'SELECT memory_id, detail FROM audit_event '
         'WHERE project_id=? AND actor_agent_id=? AND action=? ORDER BY id DESC',
@@ -510,12 +541,15 @@ def _process_builtin_mutation(conn, event_id):
             decision = 'builtin_memory_replace_missing_content'
             conn.execute('UPDATE ingest_event SET decision=? WHERE id=?', (decision, event_id))
             return {'event_id': event_id, 'status': 'pending', 'decision': decision}
-        core.supersede(conn, memory_id, agent_id, new_content, reason=marker)
+        core.supersede(
+            conn, memory_id, agent_id, new_content,
+            reason=marker, write_key=marker
+        )
         decision = 'builtin_memory_replaced'
     else:
         # A durable remove is a refusal to retain this claim. Rejecting leaves only
         # its fingerprint tombstone, preventing later journal replay from resurrecting it.
-        core.reject(conn, memory_id, agent_id, marker)
+        core.reject(conn, memory_id, agent_id, marker, write_key=marker)
         decision = 'builtin_memory_removed'
     return _finish_builtin_mutation(conn, event_id, memory_id, decision)
 
@@ -526,20 +560,7 @@ def process_event(conn, event_id):
     Explicit durable user signals become private candidate memories. Ambiguous
     events stay pending for a future semantic analyzer or operator review.
     """
-    preview = conn.execute(
-        'SELECT event_type, metadata, status FROM ingest_event WHERE id=?', (event_id,)
-    ).fetchone()
-    if preview is None:
-        raise core.MemCoreError(f'ingest event not found: {event_id}')
-    event_type, metadata_raw, preview_status = preview
-    if preview_status == 'pending' and event_type == 'memory_write':
-        try:
-            preview_metadata = json.loads(metadata_raw or '{}')
-        except (TypeError, ValueError, json.JSONDecodeError):
-            preview_metadata = {}
-        if str(preview_metadata.get('action') or '').strip().lower() in ('replace', 'remove'):
-            return _process_builtin_mutation(conn, event_id)
-
+    mutation_path = False
     conn.execute('BEGIN IMMEDIATE')
     try:
         row = conn.execute(
@@ -553,10 +574,19 @@ def process_event(conn, event_id):
             metadata = json.loads(metadata_raw or '{}')
         except (TypeError, ValueError, json.JSONDecodeError):
             metadata = {}
-        core._require_membership(conn, project_id, agent_id)
         if status != 'pending':
             conn.execute('ROLLBACK')
             return {'event_id': event_id, 'status': status}
+        if event_type == 'memory_write':
+            action = str(metadata.get('action') or '').strip().lower()
+            if action in ('replace', 'remove'):
+                # Built-in mutations call core write APIs that own their own
+                # transactions. Release this event-classification transaction
+                # before entering that path.
+                conn.execute('ROLLBACK')
+                mutation_path = True
+                return _process_builtin_mutation(conn, event_id)
+        core._require_membership(conn, project_id, agent_id)
 
         if event_type == 'memory_write' and metadata.get('success') is False:
             decision, reason, candidate = (
@@ -627,6 +657,8 @@ def process_event(conn, event_id):
             conn.execute('ROLLBACK')
         except Exception:
             pass
+        if mutation_path:
+            raise
         try:
             conn.execute('BEGIN IMMEDIATE')
             conn.execute(

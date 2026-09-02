@@ -1,0 +1,187 @@
+"""Deterministic performance regressions for MemCore hot paths.
+
+These tests avoid wall-clock thresholds. They verify indexed query plans, runtime
+openers that skip migration/WAL negotiation, and fingerprint lookups that do not
+scan/fingerprint every private memory once migration 0010 is in place.
+"""
+import os
+import sqlite3
+import tempfile
+import unittest
+from unittest import mock
+
+from memcore import core, ingest, store
+
+
+class PerformanceFastPathTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='memcore_perf_')
+        self.db = os.path.join(self.tmp.name, 'memory.db')
+        self.conn = store.open_store(self.db)
+        self.conn.execute("INSERT INTO project (id,name) VALUES ('proj','demo')")
+        self.conn.execute(
+            "INSERT INTO agent (id,name,profile_key) VALUES ('agent','alice','alice')"
+        )
+        self.conn.execute(
+            "INSERT INTO project_membership (project_id,agent_id,role) "
+            "VALUES ('proj','agent','owner')"
+        )
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def test_schema_0010_installs_fast_path_indexes(self):
+        self.assertEqual(store.MIGRATIONS[-1][0], '0010_performance_fast_paths')
+        memory_indexes = {
+            row[1] for row in self.conn.execute("PRAGMA index_list('memory')").fetchall()
+        }
+        ingest_indexes = {
+            row[1] for row in self.conn.execute("PRAGMA index_list('ingest_event')").fetchall()
+        }
+        derivation_indexes = {
+            row[1] for row in self.conn.execute("PRAGMA index_list('ingest_derivation')").fetchall()
+        }
+        audit_indexes = {
+            row[1] for row in self.conn.execute("PRAGMA index_list('audit_event')").fetchall()
+        }
+        self.assertIn('idx_memory_private_claim', memory_indexes)
+        self.assertIn('idx_ingest_event_pending_decision', ingest_indexes)
+        self.assertIn('idx_ingest_derivation_memory_event', derivation_indexes)
+        self.assertIn('idx_audit_mutation_recovery', audit_indexes)
+
+    def test_upgrade_from_0009_backfills_current_fingerprints(self):
+        legacy = os.path.join(self.tmp.name, 'legacy-0009.db')
+        conn = sqlite3.connect(legacy, isolation_level=None)
+        try:
+            conn.execute('PRAGMA foreign_keys = ON')
+            for stmt in store._script_statements(store.SCHEMA_PATH.read_text(encoding='utf-8')):
+                conn.execute(stmt)
+            conn.execute(
+                'CREATE TABLE schema_migrations ('
+                'version TEXT PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime(\'now\')), '
+                'lock_holder TEXT, lock_until REAL)'
+            )
+            conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES ('0001_initial_contract')"
+            )
+            for name, sql in store.MIGRATIONS[1:-1]:
+                store._apply_migration(conn, name, sql)
+            conn.execute("INSERT INTO project (id,name) VALUES ('p','legacy')")
+            conn.execute(
+                "INSERT INTO agent (id,name,profile_key) VALUES ('a','legacy','legacy')"
+            )
+            conn.execute(
+                "INSERT INTO project_membership (project_id,agent_id,role) "
+                "VALUES ('p','a','owner')"
+            )
+            conn.execute('BEGIN IMMEDIATE')
+            conn.execute(
+                "INSERT INTO memory "
+                "(id,project_id,scope,owner_agent_id,current_version_id) "
+                "VALUES ('m','p','private','a','v')"
+            )
+            conn.execute(
+                "INSERT INTO memory_version "
+                "(id,memory_id,content,created_by_agent_id) "
+                "VALUES ('v','m','Legacy durable claim','a')"
+            )
+            conn.execute('COMMIT')
+        finally:
+            conn.close()
+
+        upgraded = store.open_store(legacy)
+        try:
+            self.assertEqual(
+                upgraded.execute('SELECT claim_fingerprint FROM memory WHERE id=\'m\'').fetchone()[0],
+                core.fingerprint('Legacy durable claim')
+            )
+            self.assertEqual(store._current_version(upgraded), '0010_performance_fast_paths')
+        finally:
+            upgraded.close()
+
+    def test_engine_writes_and_supersede_keep_fingerprint_index_current(self):
+        memory_id, _ = core.create_memory(
+            self.conn, 'proj', 'agent', 'Preferred editor is Helix', scope='private'
+        )
+        stored = self.conn.execute(
+            'SELECT claim_fingerprint FROM memory WHERE id=?', (memory_id,)
+        ).fetchone()[0]
+        self.assertEqual(stored, core.fingerprint('Preferred editor is Helix'))
+
+        core.supersede(self.conn, memory_id, 'agent', 'Preferred editor is Zed')
+        stored = self.conn.execute(
+            'SELECT claim_fingerprint FROM memory WHERE id=?', (memory_id,)
+        ).fetchone()[0]
+        self.assertEqual(stored, core.fingerprint('Preferred editor is Zed'))
+
+    def test_private_claim_lookup_uses_index_without_python_rescan(self):
+        target_id = None
+        for index in range(80):
+            memory_id, _ = core.create_memory(
+                self.conn, 'proj', 'agent', f'indexed private claim {index}', scope='private'
+            )
+            if index == 57:
+                target_id = memory_id
+        target_fp = core.fingerprint('indexed private claim 57')
+
+        # Indexed rows should not need content fingerprinting at lookup time.
+        with mock.patch.object(core, 'fingerprint', side_effect=AssertionError('slow scan')):
+            found = ingest._find_private_claim(self.conn, 'proj', 'agent', target_fp)
+        self.assertEqual(found, target_id)
+
+        plan = self.conn.execute(
+            "EXPLAIN QUERY PLAN SELECT m.id FROM memory m "
+            "WHERE m.project_id=? AND m.scope='private' AND m.owner_agent_id=? "
+            "AND m.claim_fingerprint=? "
+            "AND m.lifecycle NOT IN ('rejected','disabled','superseded')",
+            ('proj', 'agent', target_fp)
+        ).fetchall()
+        self.assertIn('idx_memory_private_claim', ' '.join(str(row) for row in plan))
+
+    def test_semantic_queue_query_uses_partial_index(self):
+        event_id, _ = ingest.append_event(
+            self.conn, 'proj', 'agent', 'turn', session_id='queue-index',
+            user_content='This may become a durable project constraint.',
+            assistant_content='Acknowledged.'
+        )
+        ingest.process_event(self.conn, event_id)
+        plan = self.conn.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT id,event_type,user_content,assistant_content,metadata,decision,created_at "
+            "FROM ingest_event WHERE project_id=? AND agent_id=? AND status='pending' "
+            "AND decision IN (?) ORDER BY created_at,id LIMIT ?",
+            ('proj', 'agent', 'semantic_review_required', 5)
+        ).fetchall()
+        self.assertIn(
+            'idx_ingest_event_pending_decision', ' '.join(str(row) for row in plan)
+        )
+
+    def test_runtime_openers_require_existing_store_and_skip_migrations(self):
+        self.conn.close()
+        with mock.patch.object(store, 'apply_migrations', side_effect=AssertionError('migration')):
+            rw = store.open_runtime_store(self.db)
+            try:
+                self.assertEqual(rw.execute('SELECT COUNT(*) FROM project').fetchone()[0], 1)
+            finally:
+                rw.close()
+            ro = store.open_runtime_store_readonly(self.db)
+            try:
+                self.assertEqual(ro.execute('SELECT COUNT(*) FROM project').fetchone()[0], 1)
+                with self.assertRaises(Exception):
+                    ro.execute("INSERT INTO project (id,name) VALUES ('x','x')")
+            finally:
+                ro.close()
+        # Re-open for tearDown.
+        self.conn = store.open_store(self.db)
+
+        missing = os.path.join(self.tmp.name, 'missing.db')
+        with self.assertRaises(store.StoreError):
+            store.open_runtime_store(missing)
+        with self.assertRaises(store.StoreError):
+            store.open_runtime_store_readonly(missing)
+        self.assertFalse(os.path.exists(missing))
+
+
+if __name__ == '__main__':
+    unittest.main()
