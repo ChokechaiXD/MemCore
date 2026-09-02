@@ -405,6 +405,55 @@ class CliImportTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 1)
         self.assertIn('idempotency violations: 1', output.getvalue())
 
+    def test_doctor_detects_cross_memory_current_version_pointer(self):
+        conn = store.open_store(self.db)
+        conn.execute("INSERT INTO agent (id,name,profile_key) VALUES ('agent-pointer','pointer','pointer')")
+        conn.execute(
+            "INSERT INTO project_membership (project_id,agent_id,role) "
+            "VALUES ('proj-demo','agent-pointer','owner')"
+        )
+        first_id, _ = core.create_memory(
+            conn, 'proj-demo', 'agent-pointer', 'first pointer claim', scope='project'
+        )
+        _second_id, second_ver = core.create_memory(
+            conn, 'proj-demo', 'agent-pointer', 'second pointer claim', scope='project'
+        )
+        conn.execute('DROP TRIGGER memory_current_version_owner_update')
+        conn.execute(
+            'UPDATE memory SET current_version_id=?, claim_fingerprint=? WHERE id=?',
+            (second_ver, core.fingerprint('second pointer claim'), first_id)
+        )
+        self.assertEqual(conn.execute('PRAGMA foreign_key_check').fetchall(), [])
+        conn.close()
+        output = io.StringIO()
+        with self.assertRaises(SystemExit) as cm, contextlib.redirect_stdout(output):
+            cli.main(['--db', self.db, 'doctor'])
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn('current-version ownership violations:', output.getvalue())
+        self.assertIn(first_id, output.getvalue())
+
+    def test_doctor_detects_current_memory_fingerprint_drift(self):
+        conn = store.open_store(self.db)
+        conn.execute("INSERT INTO agent (id,name,profile_key) VALUES ('agent-fp','fp','fp')")
+        conn.execute(
+            "INSERT INTO project_membership (project_id,agent_id,role) "
+            "VALUES ('proj-demo','agent-fp','owner')"
+        )
+        mem_id, _ = core.create_memory(
+            conn, 'proj-demo', 'agent-fp', 'fingerprint drift sentinel', scope='project'
+        )
+        conn.execute(
+            "UPDATE memory SET claim_fingerprint='0000000000000000' WHERE id=?",
+            (mem_id,)
+        )
+        conn.close()
+        output = io.StringIO()
+        with self.assertRaises(SystemExit) as cm, contextlib.redirect_stdout(output):
+            cli.main(['--db', self.db, 'doctor'])
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn('memory fingerprint violations:', output.getvalue())
+        self.assertIn(mem_id, output.getvalue())
+
     def test_doctor_detects_rejected_memory_without_active_guard(self):
         conn = store.open_store(self.db)
         conn.execute("INSERT INTO agent (id,name,profile_key) VALUES ('agent-a','a','a')")

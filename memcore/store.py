@@ -9,6 +9,7 @@ import os
 import sqlite3
 import pathlib
 import time
+import unicodedata
 
 SCHEMA_PATH = pathlib.Path(__file__).resolve().parent.parent / 'schema' / 'schema.sql'
 _MIGRATION_LOCK_VERSION = '__migration_lock__'
@@ -234,6 +235,37 @@ CREATE INDEX IF NOT EXISTS idx_memory_project_claim
 ON memory(project_id, scope, claim_fingerprint, lifecycle);
 """
 
+# Data-only repair. Python recomputes Unicode-normalized fingerprints and
+# migrates fingerprint-derived tombstone/idempotency references transactionally.
+_UNICODE_FINGERPRINT_REPAIR = "SELECT 1;"
+
+_CURRENT_VERSION_OWNERSHIP = """
+CREATE TRIGGER IF NOT EXISTS memory_current_version_owner_insert
+BEFORE INSERT ON memory
+WHEN new.current_version_id IS NOT NULL AND EXISTS (
+  SELECT 1 FROM memory_version v
+  WHERE v.id=new.current_version_id AND v.memory_id != new.id
+) BEGIN
+  SELECT RAISE(ABORT, 'current_version_id belongs to another memory');
+END;
+CREATE TRIGGER IF NOT EXISTS memory_current_version_owner_update
+BEFORE UPDATE OF current_version_id ON memory
+WHEN new.current_version_id IS NOT NULL AND EXISTS (
+  SELECT 1 FROM memory_version v
+  WHERE v.id=new.current_version_id AND v.memory_id != new.id
+) BEGIN
+  SELECT RAISE(ABORT, 'current_version_id belongs to another memory');
+END;
+CREATE TRIGGER IF NOT EXISTS memory_version_current_owner_insert
+BEFORE INSERT ON memory_version
+WHEN EXISTS (
+  SELECT 1 FROM memory m
+  WHERE m.current_version_id=new.id AND m.id != new.memory_id
+) BEGIN
+  SELECT RAISE(ABORT, 'memory_version does not own referencing memory');
+END;
+"""
+
 MIGRATIONS = [
     ('0001_initial_contract', None),  # None = apply schema.sql verbatim
     ('0002_fts_sync_triggers', _FTS_TRIGGERS),
@@ -259,6 +291,8 @@ CREATE INDEX IF NOT EXISTS idx_tombstone_fingerprint ON tombstone(claim_fingerpr
     ('0009_semantic_analysis', _SEMANTIC_ANALYSIS),
     ('0010_performance_fast_paths', _PERFORMANCE_FAST_PATHS),
     ('0011_performance_round2', _PERFORMANCE_ROUND2),
+    ('0012_unicode_fingerprint_repair', _UNICODE_FINGERPRINT_REPAIR),
+    ('0013_current_version_ownership', _CURRENT_VERSION_OWNERSHIP),
 ]
 
 
@@ -271,6 +305,30 @@ def _table_exists(conn, table):
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
     )
     return cur.fetchone() is not None
+
+
+def _migration_history_violations(conn):
+    """Return gaps/unknown entries in the applied migration prefix."""
+    if not _table_exists(conn, 'schema_migrations'):
+        return []
+    applied = {
+        row[0] for row in conn.execute(
+            'SELECT version FROM schema_migrations WHERE version != ?',
+            (_MIGRATION_LOCK_VERSION,)
+        ).fetchall()
+    }
+    if not applied:
+        return []
+    known = [name for name, _sql in MIGRATIONS]
+    unknown = sorted(applied.difference(known))
+    violations = [('unknown', value) for value in unknown]
+    known_applied = [name for name in known if name in applied]
+    if known_applied:
+        highest = known.index(known_applied[-1])
+        for missing in known[:highest + 1]:
+            if missing not in applied:
+                violations.append(('missing', missing))
+    return violations
 
 
 def _current_version(conn):
@@ -369,6 +427,9 @@ def open_store_readonly(db_path: str) -> sqlite3.Connection:
     """Open an existing, current MemCore store without schema/domain writes."""
     conn = _open_existing_connection(db_path, readonly=True)
     try:
+        history_violations = _migration_history_violations(conn)
+        if history_violations:
+            raise StoreError(f'invalid migration history: {history_violations[:5]}')
         current = _current_version(conn)
         expected = MIGRATIONS[-1][0]
         if current != expected:
@@ -491,6 +552,9 @@ def _renew_migration_lock(conn, holder):
 def _run_migrations(conn):
     """Apply pending migrations under one crash-visible process lock."""
     known = [v for v, _ in MIGRATIONS]
+    history_violations = _migration_history_violations(conn)
+    if history_violations:
+        raise StoreError(f'invalid migration history: {history_violations[:5]}')
     version = _current_version(conn)
     if version is not None and version not in known:
         raise StoreError(f'unsupported schema migration version: {version}')
@@ -503,6 +567,9 @@ def _run_migrations(conn):
     try:
         # Re-read after acquiring: another process may have completed while
         # this connection was waiting for the lock.
+        history_violations = _migration_history_violations(conn)
+        if history_violations:
+            raise StoreError(f'invalid migration history: {history_violations[:5]}')
         version = _current_version(conn)
         if version is None:
             _apply_migration(
@@ -538,21 +605,103 @@ def _script_statements(sql):
         raise StoreError('incomplete SQL statement in migration')
 
 
+def _legacy_fingerprint(content):
+    """Fingerprint algorithm used by migration 0010 before Unicode NFC hardening."""
+    normalized = ' '.join(str(content or '').lower().strip().split())
+    return hashlib.sha256(normalized.encode('utf-8')).hexdigest()[:16]
+
+
+def _canonical_fingerprint(content):
+    """Storage-side copy of core.fingerprint() without importing core circularly."""
+    normalized = unicodedata.normalize(
+        'NFC', ' '.join(str(content or '').lower().strip().split())
+    )
+    return hashlib.sha256(normalized.encode('utf-8')).hexdigest()[:16]
+
+
 def _backfill_current_fingerprints(conn):
     """Populate the indexed fingerprint for memories created before migration 0010."""
     rows = conn.execute(
         'SELECT m.id, v.content FROM memory m '
-        'JOIN memory_version v ON v.id=m.current_version_id '
+        'JOIN memory_version v ON v.id=m.current_version_id AND v.memory_id=m.id '
         'WHERE m.claim_fingerprint IS NULL'
     ).fetchall()
-    updates = []
-    for memory_id, content in rows:
-        normalized = ' '.join(str(content or '').lower().strip().split())
-        claim_fp = hashlib.sha256(normalized.encode()).hexdigest()[:16]
-        updates.append((claim_fp, memory_id))
+    updates = [(_canonical_fingerprint(content), memory_id)
+               for memory_id, content in rows]
     if updates:
         conn.executemany(
             'UPDATE memory SET claim_fingerprint=? WHERE id=?', updates
+        )
+
+
+def _current_version_ownership_violations(conn):
+    """Rows whose current-version pointer is absent or owned by another memory."""
+    return conn.execute(
+        'SELECT m.id, m.current_version_id, v.memory_id FROM memory m '
+        'LEFT JOIN memory_version v ON v.id=m.current_version_id '
+        'WHERE m.current_version_id IS NULL OR v.id IS NULL OR v.memory_id != m.id '
+        'ORDER BY m.id'
+    ).fetchall()
+
+
+def _repair_unicode_fingerprints(conn):
+    """Repair pre-NFC fingerprints plus their durable refusal/idempotency references."""
+    versions = conn.execute(
+        'SELECT id, content FROM memory_version'
+    ).fetchall()
+    remap = {}
+    canonical_by_version = {}
+    for version_id, content in versions:
+        old_fp = _legacy_fingerprint(content)
+        new_fp = _canonical_fingerprint(content)
+        canonical_by_version[version_id] = new_fp
+        if old_fp != new_fp:
+            remap.setdefault(old_fp, set()).add(new_fp)
+
+    # Tombstones do not retain claim text. Historical immutable versions provide
+    # the safe bridge from the old fingerprint to the canonical one. Refuse an
+    # ambiguous truncated-hash remap rather than guessing.
+    for old_fp, new_fps in remap.items():
+        if len(new_fps) != 1:
+            raise StoreError(f'ambiguous legacy fingerprint remap: {old_fp}')
+        new_fp = next(iter(new_fps))
+        conn.execute(
+            'UPDATE tombstone SET claim_fingerprint=? WHERE claim_fingerprint=?',
+            (new_fp, old_fp)
+        )
+
+    current_rows = conn.execute(
+        'SELECT id, current_version_id FROM memory'
+    ).fetchall()
+    conn.executemany(
+        'UPDATE memory SET claim_fingerprint=? WHERE id=?',
+        [(canonical_by_version[version_id], memory_id)
+         for memory_id, version_id in current_rows]
+    )
+
+    # Keep old idempotency keys for replay compatibility and add canonical aliases
+    # for the known fingerprint-derived key families used by MemCore/Hermes.
+    aliases = []
+    for key, project_id, memory_id, version_id, created_at in conn.execute(
+        'SELECT key, project_id, memory_id, version_id, created_at FROM idempotency_key'
+    ).fetchall():
+        if not key.startswith(('remember:', 'observe:', 'import:')):
+            continue
+        content_row = conn.execute(
+            'SELECT content FROM memory_version WHERE id=?', (version_id,)
+        ).fetchone()
+        if content_row is None:
+            continue
+        old_fp = _legacy_fingerprint(content_row[0])
+        new_fp = _canonical_fingerprint(content_row[0])
+        if old_fp != new_fp and key.endswith(':' + old_fp):
+            aliases.append((key[:-len(old_fp)] + new_fp,
+                            project_id, memory_id, version_id, created_at))
+    if aliases:
+        conn.executemany(
+            'INSERT OR IGNORE INTO idempotency_key '
+            '(key, project_id, memory_id, version_id, created_at) VALUES (?, ?, ?, ?, ?)',
+            aliases
         )
 
 
@@ -584,10 +733,19 @@ def _apply_migration(conn, name, sql):
             ).fetchone():
                 conn.execute('ROLLBACK')
                 return
+            if name == '0013_current_version_ownership':
+                ownership_violations = _current_version_ownership_violations(conn)
+                if ownership_violations:
+                    raise StoreError(
+                        'current-version ownership violations before migration: '
+                        f'{ownership_violations[:5]}'
+                    )
             for stmt in _script_statements(sql):
                 conn.execute(stmt)
             if name == '0010_performance_fast_paths':
                 _backfill_current_fingerprints(conn)
+            elif name == '0012_unicode_fingerprint_repair':
+                _repair_unicode_fingerprints(conn)
             if rebuild_fk:
                 violations = conn.execute('PRAGMA foreign_key_check').fetchall()
                 if violations:

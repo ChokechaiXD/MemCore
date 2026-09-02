@@ -39,6 +39,14 @@ def _clean_text(value):
     return value[:MAX_FIELD_CHARS]
 
 
+def _bounded_session_id(value):
+    raw = str(value or '')
+    if len(raw) <= 512:
+        return raw
+    suffix = '~' + hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]
+    return raw[:512 - len(suffix)] + suffix
+
+
 def _payload_hash(event_type, user_content, assistant_content, metadata):
     payload = json.dumps({
         'event_type': event_type,
@@ -54,8 +62,12 @@ def append_event(conn, project_id, agent_id, event_type, *, session_id='',
     """Durably append one raw ingress event; retry-safe within its session."""
     if event_type not in EVENT_TYPES:
         raise core.MemCoreError(f'invalid ingest event type: {event_type}')
-    user_content = _clean_text(user_content)
-    assistant_content = _clean_text(assistant_content)
+    raw_user_content = '' if user_content is None else user_content
+    raw_assistant_content = '' if assistant_content is None else assistant_content
+    if not isinstance(raw_user_content, str) or not isinstance(raw_assistant_content, str):
+        raise core.MemCoreError('journal content must be a string')
+    user_content = _clean_text(raw_user_content)
+    assistant_content = _clean_text(raw_assistant_content)
     metadata = metadata if isinstance(metadata, dict) else {}
     memory_action = str(metadata.get('action') or '').strip().lower()
     builtin_metadata = metadata.get('builtin_metadata')
@@ -70,8 +82,12 @@ def append_event(conn, project_id, agent_id, event_type, *, session_id='',
         raise core.MemCoreError(
             'journal event must contain user or assistant content, or a memory remove old_text'
         )
-    session_id = str(session_id or '')[:512]
-    content_hash = _payload_hash(event_type, user_content, assistant_content, metadata)
+    session_id = _bounded_session_id(session_id)
+    # Hash the full source payload before bounded storage truncation. Otherwise
+    # distinct long turns sharing the first MAX_FIELD_CHARS collapse together.
+    content_hash = _payload_hash(
+        event_type, raw_user_content, raw_assistant_content, metadata
+    )
     event_id = 'evt-' + hashlib.sha256(
         f'{project_id}\0{agent_id}\0{session_id}\0{content_hash}'.encode('utf-8')
     ).hexdigest()[:24]
@@ -353,7 +369,7 @@ def _private_claim_ids(conn, project_id, agent_id, claim_fp, *, active_only=Fals
     # repair those rows once so future lookups stay on the indexed fast path.
     legacy = conn.execute(
         'SELECT m.id, v.content FROM memory m '
-        'JOIN memory_version v ON v.id=m.current_version_id '
+        'JOIN memory_version v ON v.id=m.current_version_id AND v.memory_id=m.id '
         "WHERE m.project_id=? AND m.scope='private' AND m.owner_agent_id=? "
         'AND m.claim_fingerprint IS NULL AND ' + lifecycle_sql,
         (project_id, agent_id)
@@ -793,41 +809,62 @@ def journal_stats(conn, project_id=None, agent_id=None):
     }
 
 
-def dismiss_unresolved_event(conn, event_id, actor_agent_id, rationale='operator_dismissed'):
-    """Dismiss a pending unresolved built-in mutation or ambiguous journal event.
+def _dismissable_pending_decision(decision):
+    if decision in SEMANTIC_QUEUE_DECISIONS:
+        return True
+    value = str(decision or '')
+    return value.startswith('builtin_memory_') and (
+        value.endswith('_unresolved_target')
+        or value.endswith('_missing_old_text')
+        or value.endswith('_requires_review')
+        or value == 'builtin_memory_replace_missing_content'
+    )
 
-    Transitions status to 'ignored' and records an audit event, removing it from
-    operator_attention.
-    """
+
+def dismiss_unresolved_event(conn, event_id, actor_agent_id, rationale='operator_dismissed'):
+    """Dismiss an owned/operator-approved pending review event, with audit."""
     conn.execute('BEGIN IMMEDIATE')
     try:
         row = conn.execute(
-            'SELECT project_id, status, decision FROM ingest_event WHERE id=?',
+            'SELECT project_id, agent_id, status, decision FROM ingest_event WHERE id=?',
             (event_id,)
         ).fetchone()
         if row is None:
             raise core.NotFound(f'ingest event not found: {event_id}')
-        project_id, status, decision = row
+        project_id, event_agent_id, status, decision = row
         if status != 'pending':
             raise core.MemCoreError(f'event {event_id} is not pending (status: {status})')
-        core._require_membership(conn, project_id, actor_agent_id)
+        role = core._require_membership(conn, project_id, actor_agent_id)
+        if actor_agent_id != event_agent_id and role != 'owner':
+            raise core.PermissionDenied(
+                'only the event owner or a project owner may dismiss this event'
+            )
+        if not _dismissable_pending_decision(decision):
+            raise core.MemCoreError(
+                f'event {event_id} is not awaiting dismissable review '
+                f'(decision={decision or "none"})'
+            )
+        dismissed_decision = (
+            'semantic_review_dismissed'
+            if decision in SEMANTIC_QUEUE_DECISIONS
+            else 'builtin_memory_mutation_dismissed'
+        )
         now = core._now()
         conn.execute(
-            "UPDATE ingest_event SET status='ignored', "
-            "decision='builtin_memory_mutation_dismissed', "
-            "processed_at=? WHERE id=?",
-            (now, event_id)
+            "UPDATE ingest_event SET status='ignored', decision=?, processed_at=? WHERE id=?",
+            (dismissed_decision, now, event_id)
         )
         core._audit(
             conn, 'journal_dismiss', actor_agent_id, project_id=project_id,
-            detail={'event_id': event_id, 'previous_decision': decision,
+            detail={'event_id': event_id, 'event_agent_id': event_agent_id,
+                    'previous_decision': decision,
                     'rationale': str(rationale or '')[:1000]}
         )
         conn.execute('COMMIT')
         return {
             'event_id': event_id,
             'status': 'ignored',
-            'decision': 'builtin_memory_mutation_dismissed'
+            'decision': dismissed_decision
         }
     except Exception:
         try:

@@ -7,6 +7,7 @@ scan/fingerprint every private memory once migration 0010 is in place.
 import os
 import sqlite3
 import tempfile
+import unicodedata
 import unittest
 from unittest import mock
 
@@ -32,7 +33,7 @@ class PerformanceFastPathTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_schema_installs_fast_path_indexes(self):
-        self.assertEqual(store.MIGRATIONS[-1][0], '0011_performance_round2')
+        self.assertEqual(store.MIGRATIONS[-1][0], '0013_current_version_ownership')
         memory_indexes = {
             row[1] for row in self.conn.execute("PRAGMA index_list('memory')").fetchall()
         }
@@ -66,7 +67,9 @@ class PerformanceFastPathTests(unittest.TestCase):
             conn.execute(
                 "INSERT INTO schema_migrations (version) VALUES ('0001_initial_contract')"
             )
-            for name, sql in store.MIGRATIONS[1:-2]:
+            for name, sql in store.MIGRATIONS[1:]:
+                if name == '0010_performance_fast_paths':
+                    break
                 store._apply_migration(conn, name, sql)
             conn.execute("INSERT INTO project (id,name) VALUES ('p','legacy')")
             conn.execute(
@@ -97,9 +100,116 @@ class PerformanceFastPathTests(unittest.TestCase):
                 upgraded.execute('SELECT claim_fingerprint FROM memory WHERE id=\'m\'').fetchone()[0],
                 core.fingerprint('Legacy durable claim')
             )
-            self.assertEqual(store._current_version(upgraded), '0011_performance_round2')
+            self.assertEqual(store._current_version(upgraded), '0013_current_version_ownership')
         finally:
             upgraded.close()
+
+    def test_upgrade_from_0011_repairs_unicode_tombstone_and_idempotency(self):
+        legacy = os.path.join(self.tmp.name, 'legacy-0011.db')
+        conn = store.open_store(legacy)
+        try:
+            conn.execute("INSERT INTO project (id,name) VALUES ('p','legacy-unicode')")
+            conn.execute(
+                "INSERT INTO agent (id,name,profile_key) VALUES ('a','legacy','legacy')"
+            )
+            conn.execute(
+                "INSERT INTO project_membership (project_id,agent_id,role) "
+                "VALUES ('p','a','owner')"
+            )
+            content = unicodedata.normalize('NFD', 'café durable policy')
+            old_fp = store._legacy_fingerprint(content)
+            canonical_fp = core.fingerprint(content)
+            self.assertNotEqual(old_fp, canonical_fp)
+            memory_id, version_id = core.create_memory(
+                conn, 'p', 'a', content, scope='project',
+                idempotency_key=f'remember:p:a:{old_fp}'
+            )
+            conn.execute(
+                'UPDATE memory SET claim_fingerprint=? WHERE id=?',
+                (old_fp, memory_id)
+            )
+            core.reject(conn, memory_id, 'a', 'legacy unicode reject')
+            conn.execute(
+                "DELETE FROM schema_migrations WHERE version IN "
+                "('0012_unicode_fingerprint_repair','0013_current_version_ownership')"
+            )
+        finally:
+            conn.close()
+
+        upgraded = store.open_store(legacy)
+        try:
+            canonical_fp = core.fingerprint('café durable policy')
+            self.assertEqual(
+                upgraded.execute(
+                    'SELECT claim_fingerprint FROM memory WHERE id=?', (memory_id,)
+                ).fetchone()[0],
+                canonical_fp
+            )
+            self.assertIsNotNone(upgraded.execute(
+                'SELECT 1 FROM tombstone WHERE claim_fingerprint=? AND overridden_by IS NULL',
+                (canonical_fp,)
+            ).fetchone())
+            self.assertIsNotNone(upgraded.execute(
+                'SELECT 1 FROM idempotency_key WHERE key=?',
+                (f'remember:p:a:{canonical_fp}',)
+            ).fetchone())
+            with self.assertRaises(core.TombstoneBlocked):
+                core.create_memory(
+                    upgraded, 'p', 'a', 'café durable policy', scope='project'
+                )
+        finally:
+            upgraded.close()
+
+    def test_migration_history_gap_fails_closed(self):
+        broken = os.path.join(self.tmp.name, 'migration-gap.db')
+        conn = store.open_store(broken)
+        try:
+            conn.execute(
+                "DELETE FROM schema_migrations WHERE version='0012_unicode_fingerprint_repair'"
+            )
+        finally:
+            conn.close()
+
+        with self.assertRaises(store.StoreError) as cm:
+            store.open_store(broken)
+        self.assertIn('invalid migration history', str(cm.exception))
+        self.assertIn('0012_unicode_fingerprint_repair', str(cm.exception))
+
+    def test_upgrade_to_0013_fails_closed_on_cross_memory_current_pointer(self):
+        legacy = os.path.join(self.tmp.name, 'legacy-bad-pointer.db')
+        conn = store.open_store(legacy)
+        try:
+            conn.execute("INSERT INTO project (id,name) VALUES ('p','bad-pointer')")
+            conn.execute("INSERT INTO agent (id,name,profile_key) VALUES ('a','a','a')")
+            conn.execute(
+                "INSERT INTO project_membership (project_id,agent_id,role) "
+                "VALUES ('p','a','owner')"
+            )
+            first_id, _ = core.create_memory(
+                conn, 'p', 'a', 'first migration pointer', scope='project'
+            )
+            _second_id, second_ver = core.create_memory(
+                conn, 'p', 'a', 'second migration pointer', scope='project'
+            )
+            for trigger in (
+                'memory_current_version_owner_insert',
+                'memory_current_version_owner_update',
+                'memory_version_current_owner_insert',
+            ):
+                conn.execute(f'DROP TRIGGER {trigger}')
+            conn.execute(
+                "DELETE FROM schema_migrations WHERE version='0013_current_version_ownership'"
+            )
+            conn.execute(
+                'UPDATE memory SET current_version_id=?, claim_fingerprint=? WHERE id=?',
+                (second_ver, core.fingerprint('second migration pointer'), first_id)
+            )
+        finally:
+            conn.close()
+
+        with self.assertRaises(store.StoreError) as cm:
+            store.open_store(legacy)
+        self.assertIn('current-version ownership violations', str(cm.exception))
 
     def test_engine_writes_and_supersede_keep_fingerprint_index_current(self):
         memory_id, _ = core.create_memory(

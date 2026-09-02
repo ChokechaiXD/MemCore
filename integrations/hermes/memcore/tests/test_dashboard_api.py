@@ -79,6 +79,14 @@ class DashboardApiTests(unittest.TestCase):
         self.assertEqual(len(result['items']), 1)
         self.assertIn('ระบบความจำร่วม', result['items'][0]['content'])
 
+    def test_unicode_search_supplements_casefolded_fts_matches(self):
+        thai = '\u0e23\u0e30\u0e1a\u0e1a'
+        first = self.remember('proj-one', f'{thai} Alpha deployment', lifecycle='accepted')
+        second = self.remember('proj-one', f'{thai} alpha deployment backup', lifecycle='accepted')
+        result = api.search(q=f'{thai} Alpha', project='one')
+        self.assertEqual({item['id'] for item in result['items']}, {first, second})
+        self.assertEqual(len(result['items']), 2)
+
     def test_promote_does_not_resurrect_rejected_memory(self):
         mem_id = self.remember('proj-one', 'wrong rejected claim')
         core.reject(self.conn, mem_id, 'agent-a', 'wrong')

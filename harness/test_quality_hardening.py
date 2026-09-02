@@ -8,6 +8,7 @@
 """
 import os
 import pathlib
+import sqlite3
 import tempfile
 import threading
 import time
@@ -59,6 +60,50 @@ class QualityHardeningTests(unittest.TestCase):
         self.assertFalse(core.admission_allowed(self.conn, decomposed, 'proj-main', scope='project'))
         with self.assertRaises(core.TombstoneBlocked):
             core.create_memory(self.conn, 'proj-main', 'agent-alice', decomposed, scope='project')
+
+    def test_tombstone_hides_existing_accepted_duplicate_from_recall(self):
+        content = 'duplicate claim must disappear after rejection'
+        first, _ = core.create_memory(
+            self.conn, 'proj-main', 'agent-alice', content, scope='project'
+        )
+        second, _ = core.create_memory(
+            self.conn, 'proj-main', 'agent-alice', content, scope='project'
+        )
+        self.conn.execute(
+            "UPDATE memory SET lifecycle='accepted' WHERE id IN (?, ?)",
+            (first, second)
+        )
+        self.conn.commit()
+        core.reject(self.conn, second, 'agent-alice', 'claim disproven')
+
+        self.assertEqual(
+            core.search(self.conn, 'proj-main', 'agent-alice', 'duplicate claim'), []
+        )
+        self.assertEqual(
+            core.visible_memories(self.conn, 'proj-main', 'agent-alice'), []
+        )
+        historical = core.visible_memories(
+            self.conn, 'proj-main', 'agent-alice', include_rejected=True
+        )
+        self.assertEqual([row[0] for row in historical], [second])
+
+    def test_null_fingerprint_memory_fails_closed_from_recall(self):
+        memory_id, _ = core.create_memory(
+            self.conn, 'proj-main', 'agent-alice',
+            'legacy row missing indexed claim identity', scope='project'
+        )
+        self.conn.execute(
+            "UPDATE memory SET lifecycle='accepted', claim_fingerprint=NULL WHERE id=?",
+            (memory_id,)
+        )
+        self.conn.commit()
+        self.assertEqual(
+            core.search(self.conn, 'proj-main', 'agent-alice', 'legacy row'), []
+        )
+        self.assertFalse(any(
+            row[0] == memory_id
+            for row in core.visible_memories(self.conn, 'proj-main', 'agent-alice')
+        ))
 
     # ── 2. Ingest Journal Pruning & GC ─────────────────────────────────────
 
@@ -148,6 +193,35 @@ class QualityHardeningTests(unittest.TestCase):
         with self.assertRaises(core.PermissionDenied):
             ingest.dismiss_unresolved_event(self.conn, eid, 'agent-eve')
 
+    def test_member_cannot_dismiss_another_agents_review_event(self):
+        eid, _ = ingest.append_event(
+            self.conn, 'proj-main', 'agent-alice', 'turn',
+            user_content='This may become a durable preference later.'
+        )
+        ingest.process_event(self.conn, eid)
+        with self.assertRaises(core.PermissionDenied):
+            ingest.dismiss_unresolved_event(self.conn, eid, 'agent-bob')
+        self.assertEqual(
+            self.conn.execute(
+                'SELECT status, decision FROM ingest_event WHERE id=?', (eid,)
+            ).fetchone(),
+            ('pending', 'semantic_review_required')
+        )
+
+    def test_unclassified_pending_event_cannot_be_dismissed(self):
+        eid, _ = ingest.append_event(
+            self.conn, 'proj-main', 'agent-alice', 'turn',
+            user_content='raw event not processed yet'
+        )
+        with self.assertRaises(core.MemCoreError):
+            ingest.dismiss_unresolved_event(self.conn, eid, 'agent-alice')
+        self.assertEqual(
+            self.conn.execute(
+                'SELECT status, decision FROM ingest_event WHERE id=?', (eid,)
+            ).fetchone(),
+            ('pending', None)
+        )
+
     # ── 4. Connection Pool Dead Thread Eviction ────────────────────────────
 
     def test_plugin_connection_pool_evicts_dead_threads(self):
@@ -174,7 +248,78 @@ class QualityHardeningTests(unittest.TestCase):
                 self.assertIn(tid, active_tids)
             self.assertIn(threading.get_ident(), plugin._connections)
 
+    def test_dead_worker_transaction_does_not_keep_database_locked(self):
+        plugin.reset_conn()
+        state = {}
+
+        def worker():
+            conn = plugin._get_conn(self.db_path)
+            conn.execute('BEGIN IMMEDIATE')
+            state['conn'] = conn
+            state['tid'] = threading.get_ident()
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+        self.assertTrue(state['conn'].in_transaction)
+        self.assertNotEqual(state['tid'], threading.get_ident())
+
+        # A subsequent plugin access must evict/close the dead worker handle
+        # even when the pool contains fewer than five entries.
+        main_conn = plugin._get_conn(self.db_path)
+        main_conn.execute('PRAGMA busy_timeout=50')
+        main_conn.execute('BEGIN IMMEDIATE')
+        main_conn.execute('ROLLBACK')
+        with self.assertRaises(Exception):
+            state['conn'].execute('SELECT 1')
+
     # ── 5. Private Scope Security Isolation ────────────────────────────────
+
+    def test_current_version_pointer_cannot_cross_memory_ownership(self):
+        self.conn.execute("INSERT INTO project (id,name) VALUES ('proj-secret','secret')")
+        self.conn.execute(
+            "INSERT INTO project_membership (project_id,agent_id,role) "
+            "VALUES ('proj-secret','agent-alice','owner')"
+        )
+        public_id, _ = core.create_memory(
+            self.conn, 'proj-main', 'agent-alice', 'public pointer target',
+            scope='project', lifecycle='accepted'
+        )
+        _secret_id, secret_ver = core.create_memory(
+            self.conn, 'proj-secret', 'agent-alice', 'private cross-project secret',
+            scope='private', lifecycle='accepted'
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(
+                'UPDATE memory SET current_version_id=? WHERE id=?',
+                (secret_ver, public_id)
+            )
+
+    def test_reads_fail_closed_on_legacy_cross_memory_pointer(self):
+        self.conn.execute("INSERT INTO project (id,name) VALUES ('proj-secret','secret')")
+        self.conn.execute(
+            "INSERT INTO project_membership (project_id,agent_id,role) "
+            "VALUES ('proj-secret','agent-alice','owner')"
+        )
+        public_id, _ = core.create_memory(
+            self.conn, 'proj-main', 'agent-alice', 'public harmless content',
+            scope='project', lifecycle='accepted'
+        )
+        _secret_id, secret_ver = core.create_memory(
+            self.conn, 'proj-secret', 'agent-alice', 'private cross-project secret',
+            scope='private', lifecycle='accepted'
+        )
+        self.conn.execute('DROP TRIGGER memory_current_version_owner_update')
+        self.conn.execute(
+            'UPDATE memory SET current_version_id=?, claim_fingerprint=? WHERE id=?',
+            (secret_ver, core.fingerprint('private cross-project secret'), public_id)
+        )
+        visible_ids = {
+            row[0] for row in core.visible_memories(
+                self.conn, 'proj-main', 'agent-alice'
+            )
+        }
+        self.assertNotIn(public_id, visible_ids)
 
     def test_private_memory_cannot_be_read_or_modified_by_other_agent(self):
         alice_mem, _ = core.create_memory(
@@ -208,6 +353,7 @@ class QualityHardeningTests(unittest.TestCase):
             self.conn, 'proj-main', 'agent-alice', 'turn',
             user_content='cli test turn'
         )
+        ingest.process_event(self.conn, eid)
         self.conn.commit()
 
         # Run journal-dismiss via CLI

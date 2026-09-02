@@ -14,6 +14,7 @@ import sqlite3
 import uuid
 import pathlib
 import hashlib
+import unicodedata
 from datetime import datetime, timedelta
 
 SCHEMA_PATH = pathlib.Path(__file__).resolve().parent.parent / 'schema' / 'schema.sql'
@@ -76,9 +77,11 @@ def _future(days=365):
 
 
 def _fingerprint(text: str) -> str:
-    """Deterministic claim fingerprint — same input always same fingerprint."""
-    normalized = ' '.join(text.lower().strip().split())
-    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+    """Deterministic claim fingerprint — same contract as memcore.core."""
+    normalized = unicodedata.normalize(
+        'NFC', ' '.join(text.lower().strip().split())
+    )
+    return hashlib.sha256(normalized.encode('utf-8')).hexdigest()[:16]
 
 
 # ── Schema loader ──────────────────────────────────────────────────────
@@ -109,6 +112,10 @@ def seed(db_path: str = ':memory:') -> sqlite3.Connection:
     _seed_memberships(conn)
     _seed_evidence(conn)
     _seed_memories(conn)
+    # Fixtures insert rows directly, so populate the same indexed identity that
+    # engine writes maintain before recall-oriented tests run.
+    from memcore import store as _store
+    _store._backfill_current_fingerprints(conn)
     _seed_tombstone(conn)
     return conn
 

@@ -622,7 +622,21 @@ def override_tombstone(conn, tombstone_id, agent_id):
         raise
 
 
-# Ã¢â€â‚¬Ã¢â€â‚¬ reads (scope enforced in SQL WHERE) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+# Ã¢â€â‚¬Ã¢â€â‚¬ reads (scope enforced in SQL WHERE) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+
+def _recall_tombstone_guard(alias='m'):
+    """SQL predicate excluding claims blocked by active scope-aware tombstones."""
+    return (
+        f'{alias}.claim_fingerprint IS NOT NULL AND '
+        'NOT EXISTS (SELECT 1 FROM tombstone t '
+        f'WHERE t.claim_fingerprint={alias}.claim_fingerprint '
+        'AND t.overridden_by IS NULL AND ('
+        "t.scope='global' OR "
+        f't.scope={alias}.project_id OR '
+        f"({alias}.scope='private' AND "
+        f"t.scope='private:' || {alias}.project_id || ':' || {alias}.owner_agent_id)))"
+    )
+
 
 def visible_memories(conn, project_id, agent_id, include_disabled=False,
                      include_rejected=False):
@@ -640,14 +654,22 @@ def visible_memories(conn, project_id, agent_id, include_disabled=False,
         excluded.append("'rejected'")
     if not include_disabled:
         excluded.append("'disabled'")
+    if include_rejected:
+        tombstone_sql = (
+            "  AND (m.lifecycle='rejected' OR (" +
+            _recall_tombstone_guard('m') + ')) '
+        )
+    else:
+        tombstone_sql = '  AND ' + _recall_tombstone_guard('m') + ' '
     cur = conn.execute(
         'SELECT m.id, m.scope, m.lifecycle, m.verification, m.freshness, '
         '       v.content, m.owner_agent_id, m.type '
         'FROM memory m '
-        'JOIN memory_version v ON v.id = m.current_version_id '
+        'JOIN memory_version v ON v.id = m.current_version_id AND v.memory_id = m.id '
         'WHERE m.project_id = ? '
         "  AND (m.scope = 'project' OR m.owner_agent_id = ?) "
-        f'  AND m.lifecycle NOT IN ({", ".join(excluded)}) '
+        f'  AND m.lifecycle NOT IN ({", ".join(excluded)}) ' +
+        tombstone_sql +
         'ORDER BY m.pinned DESC, m.updated_at DESC, m.id ASC',
         (project_id, agent_id)
     )
@@ -661,7 +683,7 @@ def private_memories(conn, project_id, agent_id):
     cur = conn.execute(
         'SELECT m.id, m.scope, m.owner_agent_id, v.content '
         'FROM memory m '
-        'JOIN memory_version v ON v.id = m.current_version_id '
+        'JOIN memory_version v ON v.id = m.current_version_id AND v.memory_id = m.id '
         'WHERE m.project_id = ? '
         "  AND m.scope = 'private' "
         '  AND m.owner_agent_id = ?',
@@ -711,14 +733,16 @@ def search(conn, project_id, agent_id, query, limit=20):
         return []
     if _membership_role(conn, project_id, agent_id) is None:
         return []
+    exact_rows = []
     if any(ord(ch) > 127 for ch in raw_query):
-        rows = conn.execute(
+        exact_rows = conn.execute(
             'SELECT m.id, m.scope, m.lifecycle, m.verification, m.freshness, '
             '       v.content, m.owner_agent_id, 0.0 AS rank '
-            'FROM memory m JOIN memory_version v ON v.id = m.current_version_id '
+            'FROM memory m JOIN memory_version v ON v.id = m.current_version_id AND v.memory_id = m.id '
             'WHERE m.project_id = ? '
             "  AND (m.scope = 'project' OR m.owner_agent_id = ?) "
             "  AND m.lifecycle IN ('candidate', 'accepted', 'conflict') "
+            '  AND ' + _recall_tombstone_guard('m') + ' '
             '  AND instr(v.content, ?) > 0 '
             'ORDER BY m.pinned DESC, ' +
             "CASE m.lifecycle WHEN 'accepted' THEN 0 WHEN 'conflict' THEN 1 ELSE 2 END, " +
@@ -727,11 +751,12 @@ def search(conn, project_id, agent_id, query, limit=20):
             'm.updated_at DESC, m.id ASC LIMIT ?',
             (project_id, agent_id, raw_query, limit)
         ).fetchall()
-        if rows:
-            return rows
+        if len(exact_rows) >= limit:
+            return exact_rows[:limit]
     match_expr = _fts_query(raw_query)
     if not match_expr:
-        return []
+        return exact_rows
+    fts_limit = min(500, limit + len(exact_rows))
     cur = conn.execute(
         'SELECT m.id, m.scope, m.lifecycle, m.verification, m.freshness, '
         '       v.content, m.owner_agent_id, '
@@ -744,14 +769,26 @@ def search(conn, project_id, agent_id, query, limit=20):
         '  AND m.project_id = ? '
         "  AND (m.scope = 'project' OR m.owner_agent_id = ?) "
         "  AND m.lifecycle IN ('candidate', 'accepted', 'conflict') "
+        '  AND ' + _recall_tombstone_guard('m') + ' '
         'ORDER BY m.pinned DESC, ' +
         "CASE m.lifecycle WHEN 'accepted' THEN 0 WHEN 'conflict' THEN 1 ELSE 2 END, " +
         "CASE m.verification WHEN 'user_authoritative' THEN 0 WHEN 'runtime_verified' THEN 1 WHEN 'source_backed' THEN 2 ELSE 3 END, " +
         "CASE m.freshness WHEN 'current' THEN 0 WHEN 'aging' THEN 1 ELSE 2 END, " +
         'rank ASC, m.updated_at DESC, m.id ASC LIMIT ?',
-        (match_expr, project_id, agent_id, limit)
+        (match_expr, project_id, agent_id, fts_limit)
     )
-    return cur.fetchall()
+    fts_rows = cur.fetchall()
+    if not exact_rows:
+        return fts_rows[:limit]
+    seen = {row[0] for row in exact_rows}
+    merged = list(exact_rows)
+    for row in fts_rows:
+        if row[0] not in seen:
+            merged.append(row)
+            seen.add(row[0])
+            if len(merged) >= limit:
+                break
+    return merged[:limit]
 
 
 def conflict_memories(conn, project_id, agent_id):
@@ -761,9 +798,10 @@ def conflict_memories(conn, project_id, agent_id):
     cur = conn.execute(
         'SELECT m.id, m.owner_agent_id, v.content '
         'FROM memory m '
-        'JOIN memory_version v ON v.id = m.current_version_id '
+        'JOIN memory_version v ON v.id = m.current_version_id AND v.memory_id = m.id '
         "WHERE m.project_id = ? AND m.lifecycle = 'conflict' "
         "  AND (m.scope='project' OR m.owner_agent_id=?) "
+        '  AND ' + _recall_tombstone_guard('m') + ' '
         'ORDER BY m.updated_at DESC, m.id ASC',
         (project_id, agent_id)
     )
@@ -811,7 +849,7 @@ def gc_scan(conn, candidate_days=30, tombstone_days=90):
     candidates = conn.execute(
         'SELECT m.id, m.project_id, m.owner_agent_id, v.content, m.updated_at '
         'FROM memory m '
-        'JOIN memory_version v ON v.id = m.current_version_id '
+        'JOIN memory_version v ON v.id = m.current_version_id AND v.memory_id = m.id '
         "WHERE m.lifecycle = 'candidate' "
         '  AND m.pinned = 0 AND m.critical = 0 '
         '  AND datetime(m.updated_at) < datetime(?) '
@@ -851,7 +889,7 @@ def gc_apply(conn, candidate_days=30, tombstone_days=90):
             row = conn.execute(
                 'SELECT m.project_id, v.content '
                 'FROM memory m '
-                'JOIN memory_version v ON v.id=m.current_version_id '
+                'JOIN memory_version v ON v.id=m.current_version_id AND v.memory_id=m.id '
                 'WHERE m.id=? AND m.lifecycle=\'candidate\' '
                 '  AND m.pinned=0 AND m.critical=0 '
                 '  AND datetime(m.updated_at) < datetime(?) '
@@ -923,7 +961,7 @@ def stats(conn):
     ).fetchall()
     avg_len = conn.execute(
         'SELECT AVG(LENGTH(v.content)) FROM memory m '
-        'JOIN memory_version v ON v.id = m.current_version_id'
+        'JOIN memory_version v ON v.id = m.current_version_id AND v.memory_id = m.id'
     ).fetchone()[0]
     fts_rows = one('SELECT COUNT(*) FROM memory_version_fts')
     ver_rows = one('SELECT COUNT(*) FROM memory_version')
@@ -992,7 +1030,7 @@ def _claim_already_present(conn, project_id, claim_fp, scope='project', agent_id
 
     legacy_sql = (
         'SELECT v.content FROM memory m '
-        'JOIN memory_version v ON v.id=m.current_version_id '
+        'JOIN memory_version v ON v.id=m.current_version_id AND v.memory_id=m.id '
         'WHERE m.project_id=? AND m.scope=? AND m.claim_fingerprint IS NULL '
         "AND m.lifecycle != 'rejected' "
     )

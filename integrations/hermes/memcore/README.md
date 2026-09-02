@@ -20,7 +20,7 @@ memcore/
 └── tests/                   # integration regression suite
 ```
 
-Agent, dashboard, and desktop manifests use the same integration version: **0.5.0**.
+Agent, dashboard, and desktop manifests use the same integration version: **0.6.0**.
 
 ## Deploy / verify
 

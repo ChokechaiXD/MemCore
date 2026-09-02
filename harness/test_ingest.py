@@ -42,7 +42,7 @@ class TestIngestJournal(IngestTestBase):
         self.assertIn('ingest_event', names)
         self.assertIn('ingest_derivation', names)
         self.assertIn('ingest_analysis', names)
-        self.assertEqual(store.MIGRATIONS[-1][0], '0011_performance_round2')
+        self.assertEqual(store.MIGRATIONS[-1][0], '0013_current_version_ownership')
 
     def test_append_is_retry_safe(self):
         kwargs = dict(
@@ -60,6 +60,47 @@ class TestIngestJournal(IngestTestBase):
         self.assertFalse(created2)
         self.assertEqual(self.conn.execute(
             'SELECT COUNT(*) FROM ingest_event').fetchone()[0], 1)
+
+    def test_long_events_differing_after_storage_cap_do_not_deduplicate(self):
+        prefix = 'x' * ingest.MAX_FIELD_CHARS
+        first, created1 = ingest.append_event(
+            self.conn, self.project, self.alice, 'turn',
+            session_id='long-payload', user_content=prefix + 'A'
+        )
+        second, created2 = ingest.append_event(
+            self.conn, self.project, self.alice, 'turn',
+            session_id='long-payload', user_content=prefix + 'B'
+        )
+        self.assertTrue(created1)
+        self.assertTrue(created2)
+        self.assertNotEqual(first, second)
+        rows = self.conn.execute(
+            "SELECT user_content, content_hash FROM ingest_event "
+            "WHERE session_id='long-payload' ORDER BY id"
+        ).fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({len(row[0]) for row in rows}, {ingest.MAX_FIELD_CHARS})
+        self.assertEqual(len({row[1] for row in rows}), 2)
+
+    def test_long_session_ids_keep_distinct_suffixes_after_storage_cap(self):
+        prefix = 's' * 512
+        first, created1 = ingest.append_event(
+            self.conn, self.project, self.alice, 'turn',
+            session_id=prefix + '-A', user_content='same payload'
+        )
+        second, created2 = ingest.append_event(
+            self.conn, self.project, self.alice, 'turn',
+            session_id=prefix + '-B', user_content='same payload'
+        )
+        self.assertTrue(created1)
+        self.assertTrue(created2)
+        self.assertNotEqual(first, second)
+        session_ids = [row[0] for row in self.conn.execute(
+            "SELECT session_id FROM ingest_event ORDER BY id"
+        ).fetchall()]
+        self.assertEqual(len(session_ids), 2)
+        self.assertTrue(all(len(value) <= 512 for value in session_ids))
+        self.assertEqual(len(set(session_ids)), 2)
 
     def test_nonmember_cannot_write_journal(self):
         self.conn.execute(

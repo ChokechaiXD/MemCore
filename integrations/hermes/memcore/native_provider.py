@@ -239,9 +239,10 @@ class MemCoreMemoryProvider(MemoryProvider):
     def _recall_rows(self, conn, query: str):
         pinned = conn.execute(
             'SELECT m.id, m.scope, m.lifecycle, m.verification, m.freshness, v.content '
-            'FROM memory m JOIN memory_version v ON v.id=m.current_version_id '
+            'FROM memory m JOIN memory_version v ON v.id=m.current_version_id AND v.memory_id=m.id '
             "WHERE m.project_id=? AND m.lifecycle IN ('candidate','accepted','conflict') AND m.pinned=1 "
             "AND (m.scope='project' OR m.owner_agent_id=?) "
+            'AND ' + core._recall_tombstone_guard('m') + ' '
             'ORDER BY m.critical DESC, datetime(m.updated_at) DESC, m.rowid DESC LIMIT ?',
             (self._project_id, self._agent_id, self._max_items)
         ).fetchall()

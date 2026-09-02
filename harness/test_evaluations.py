@@ -20,7 +20,7 @@ import unittest
 # Fixtures live one level up; add to path so import works from harness/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import fixtures
-from memcore import core
+from memcore import core, store
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -566,6 +566,7 @@ class TestE12_TokenBudget(unittest.TestCase):
                  f'or design decision with realistic content length for token estimation.',
                  'budget seeding', fixtures.AGENT_SORA)
             )
+        store._backfill_current_fingerprints(self.conn)
         self.conn.commit()
 
         rows = _query_shared_visible(
@@ -608,6 +609,7 @@ class TestE12_TokenBudget(unittest.TestCase):
                  f'to approximate a realistic memory payload for budget calculation.',
                  'token budget test', fixtures.AGENT_SORA)
             )
+        store._backfill_current_fingerprints(self.conn)
         self.conn.commit()
 
         rows = _query_shared_visible(

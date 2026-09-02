@@ -205,7 +205,8 @@ def _resolve_project_id(db, project_ref):
 _MEMORY_SELECT = (
     'SELECT m.id, m.project_id, m.scope, m.owner_agent_id, m.type, m.lifecycle, '
     '       m.verification, m.freshness, m.pinned, v.content, v.created_at '
-    'FROM memory m JOIN memory_version v ON v.id = m.current_version_id '
+    'FROM memory m JOIN memory_version v '
+    'ON v.id = m.current_version_id AND v.memory_id = m.id '
 )
 
 
@@ -304,7 +305,8 @@ def search(q='', project=None, limit=25):
     pid = _resolve_project_id(db, project) if project else None
     raw_query = str(q).strip()
     # unicode61 does not segment Thai/CJK natural-language substrings well.
-    # Mirror core.search(): exact Unicode substring first, then normal FTS.
+    # Mirror core.search(): exact Unicode substring first, then supplement with FTS.
+    exact_rows = []
     if any(ord(ch) > 127 for ch in raw_query):
         sql = _MEMORY_SELECT + 'WHERE instr(v.content, ?) > 0 '
         args = [raw_query]
@@ -313,12 +315,12 @@ def search(q='', project=None, limit=25):
             args.append(pid)
         sql += 'ORDER BY m.pinned DESC, v.created_at DESC, m.id ASC LIMIT ?'
         args.append(limit)
-        rows = db.execute(sql, args).fetchall()
-        if rows:
-            return {'query': q, 'items': [_memory_dict(r) for r in rows]}
+        exact_rows = db.execute(sql, args).fetchall()
+        if len(exact_rows) >= limit:
+            return {'query': q, 'items': [_memory_dict(r) for r in exact_rows[:limit]]}
     match_expr = core._fts_query(raw_query)
     if not match_expr:
-        return {'query': q, 'items': []}
+        return {'query': q, 'items': [_memory_dict(r) for r in exact_rows]}
     sql = (_MEMORY_SELECT +
            'JOIN memory_version_fts fts ON fts.rowid = v.rowid '
            'WHERE memory_version_fts MATCH ? ')
@@ -329,8 +331,20 @@ def search(q='', project=None, limit=25):
     # ponytail: operator-facing dashboard — no scope filtering by design;
     # human sees everything, unlike agent tools which filter by scope.
     sql += 'ORDER BY m.pinned DESC, rank, m.id ASC LIMIT ?'
-    args.append(limit)
-    rows = db.execute(sql, args).fetchall()
+    args.append(min(500, limit + len(exact_rows)))
+    fts_rows = db.execute(sql, args).fetchall()
+    if not exact_rows:
+        rows = fts_rows[:limit]
+    else:
+        seen = {row[0] for row in exact_rows}
+        rows = list(exact_rows)
+        for row in fts_rows:
+            if row[0] not in seen:
+                rows.append(row)
+                seen.add(row[0])
+                if len(rows) >= limit:
+                    break
+        rows = rows[:limit]
     return {'query': q, 'items': [_memory_dict(r) for r in rows]}
 
 
@@ -406,7 +420,8 @@ def promote(body: dict):
     try:
         row = db.execute(
             'SELECT m.project_id, m.scope, m.owner_agent_id, m.lifecycle, v.content '
-            'FROM memory m JOIN memory_version v ON v.id=m.current_version_id '
+            'FROM memory m JOIN memory_version v '
+            'ON v.id=m.current_version_id AND v.memory_id=m.id '
             'WHERE m.id=?', (memory_id,)
         ).fetchone()
         if row is None:

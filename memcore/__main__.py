@@ -817,6 +817,24 @@ def cmd_doctor(args):
         '       AND m.project_id != ik.project_id)'
     ).fetchone()[0]
 
+    report['current_version_ownership_violations'] = conn.execute(
+        'SELECT m.id, m.current_version_id, v.memory_id FROM memory m '
+        'LEFT JOIN memory_version v ON v.id=m.current_version_id '
+        'WHERE m.current_version_id IS NULL OR v.id IS NULL OR v.memory_id != m.id '
+        'ORDER BY m.id'
+    ).fetchall()
+    report['memory_fingerprint_violations'] = []
+    for memory_id, claim_fp, content in conn.execute(
+        'SELECT m.id, m.claim_fingerprint, v.content FROM memory m '
+        'JOIN memory_version v ON v.id=m.current_version_id AND v.memory_id=m.id '
+        'ORDER BY m.id'
+    ):
+        expected_fp = core.fingerprint(content)
+        if claim_fp != expected_fp:
+            report['memory_fingerprint_violations'].append(
+                (memory_id, claim_fp, expected_fp)
+            )
+
     # 4. Tombstone/refusal-guard integrity.
     report['tombstones'] = {
         'active': conn.execute(
@@ -949,6 +967,14 @@ def cmd_doctor(args):
     print(f"orphaned versions: {report['orphaned_memory_versions']}")
     print(f"orphaned audit: {report['orphaned_audit_events']}")
     print(f"idempotency violations: {report['idempotency_violations']}")
+    print(
+        f"current-version ownership violations: "
+        f"{report['current_version_ownership_violations'] or 'none'}"
+    )
+    print(
+        f"memory fingerprint violations: "
+        f"{report['memory_fingerprint_violations'] or 'none'}"
+    )
     print(f"tombstones: {report['tombstones']['active']} active, "
           f"{report['tombstones']['overridden']} overridden")
     print(
@@ -1010,6 +1036,8 @@ def cmd_doctor(args):
         or report['orphaned_memory_versions'] > 0
         or report['orphaned_audit_events'] > 0
         or report['idempotency_violations'] > 0
+        or report['current_version_ownership_violations']
+        or report['memory_fingerprint_violations']
         or report['unguarded_rejected_memories']
         or report['tombstone_violations']
         or report['agent_name_collisions']

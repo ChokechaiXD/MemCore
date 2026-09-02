@@ -133,6 +133,32 @@ class NativeProviderTest(unittest.TestCase):
                       p.system_prompt_block())
         self.assertEqual(p.recall_status().count, 2)
 
+    def test_prefetch_excludes_pinned_duplicate_blocked_by_tombstone(self):
+        conn = store.open_store(self.db)
+        try:
+            content = 'pinned duplicate claim is no longer trusted'
+            pinned, _ = core.create_memory(
+                conn, 'proj-demo', 'agent-alice', content, scope='project'
+            )
+            rejected, _ = core.create_memory(
+                conn, 'proj-demo', 'agent-alice', content, scope='project'
+            )
+            conn.execute(
+                "UPDATE memory SET lifecycle='accepted', pinned=1 WHERE id=?",
+                (pinned,)
+            )
+            conn.execute(
+                "UPDATE memory SET lifecycle='accepted' WHERE id=?",
+                (rejected,)
+            )
+            core.reject(conn, rejected, 'agent-alice', 'claim disproven')
+        finally:
+            conn.close()
+
+        p = self.provider()
+        self.assertEqual(p.prefetch('pinned duplicate claim'), '')
+        self.assertIsNone(p.recall_status())
+
     def test_sync_turn_journals_before_admission(self):
         p = self.provider()
         p.sync_turn(

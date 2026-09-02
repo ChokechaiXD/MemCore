@@ -190,24 +190,29 @@ _connections_lock = threading.RLock()
 
 
 def _get_conn(store_path):
-    """Return one cached SQLite connection per worker thread/store path."""
+    """Return one cached SQLite connection per live worker thread/store path."""
     path = str(pathlib.Path(store_path).expanduser())
+    thread = threading.current_thread()
     tid = threading.get_ident()
     with _connections_lock:
-        if len(_connections) > 4:
-            active_tids = {t.ident for t in threading.enumerate()}
-            dead_tids = [k for k in _connections if k not in active_tids]
-            for dead in dead_tids:
-                _p, dead_conn = _connections.pop(dead)
+        # Evict dead worker handles on every access. Keeping even one dead
+        # connection can retain an unfinished transaction and lock the store.
+        # Owner-object identity also protects against OS/Python thread-id reuse.
+        for key, (owner, _p, stale_conn) in list(_connections.items()):
+            if owner is not thread and not owner.is_alive():
+                _connections.pop(key, None)
                 try:
-                    dead_conn.close()
+                    stale_conn.close()
                 except Exception:
                     pass
         entry = _connections.get(tid)
         if entry is not None:
-            current_path, conn = entry
-            if current_path == path:
+            owner, current_path, conn = entry
+            if owner is thread and current_path == path:
                 return conn
+            # A recycled thread id or path change must never inherit another
+            # worker's SQLite handle/transaction state.
+            _connections.pop(tid, None)
             try:
                 conn.close()
             except Exception:
@@ -216,7 +221,7 @@ def _get_conn(store_path):
         # sqlite thread-affinity guard only so reset_conn can close all cached
         # handles during plugin reload/tests, including handles from workers.
         conn = store.open_store(path, check_same_thread=False)
-        _connections[tid] = (path, conn)
+        _connections[tid] = (thread, path, conn)
         return conn
 
 
@@ -225,7 +230,7 @@ def reset_conn():
     with _connections_lock:
         entries = list(_connections.values())
         _connections.clear()
-    for _path, conn in entries:
+    for _owner, _path, conn in entries:
         try:
             conn.close()
         except Exception:
@@ -587,10 +592,11 @@ def pre_llm_call(ctx=None, user_message='', **_):
         pid, aid = _require_bound_membership(conn, project, agent_name)
         pinned = conn.execute(
             'SELECT m.id, m.scope, m.lifecycle, m.verification, m.freshness, v.content '
-            'FROM memory m JOIN memory_version v ON v.id = m.current_version_id '
+            'FROM memory m JOIN memory_version v ON v.id = m.current_version_id AND v.memory_id = m.id '
             'WHERE m.project_id = ? AND m.pinned = 1 '
             "  AND (m.scope = 'project' OR m.owner_agent_id = ?) "
             "  AND m.lifecycle IN ('candidate','accepted','conflict') "
+            '  AND ' + core._recall_tombstone_guard('m') + ' '
             'ORDER BY m.critical DESC, datetime(m.updated_at) DESC, m.id ASC '
             'LIMIT ?',
             (pid, aid, max_items)).fetchall()
