@@ -194,6 +194,15 @@ def _get_conn(store_path):
     path = str(pathlib.Path(store_path).expanduser())
     tid = threading.get_ident()
     with _connections_lock:
+        if len(_connections) > 4:
+            active_tids = {t.ident for t in threading.enumerate()}
+            dead_tids = [k for k in _connections if k not in active_tids]
+            for dead in dead_tids:
+                _p, dead_conn = _connections.pop(dead)
+                try:
+                    dead_conn.close()
+                except Exception:
+                    pass
         entry = _connections.get(tid)
         if entry is not None:
             current_path, conn = entry

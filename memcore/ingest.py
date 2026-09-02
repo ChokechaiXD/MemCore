@@ -791,3 +791,99 @@ def journal_stats(conn, project_id=None, agent_id=None):
             'by_verdict': analysis_by_verdict,
         },
     }
+
+
+def dismiss_unresolved_event(conn, event_id, actor_agent_id, rationale='operator_dismissed'):
+    """Dismiss a pending unresolved built-in mutation or ambiguous journal event.
+
+    Transitions status to 'ignored' and records an audit event, removing it from
+    operator_attention.
+    """
+    conn.execute('BEGIN IMMEDIATE')
+    try:
+        row = conn.execute(
+            'SELECT project_id, status, decision FROM ingest_event WHERE id=?',
+            (event_id,)
+        ).fetchone()
+        if row is None:
+            raise core.NotFound(f'ingest event not found: {event_id}')
+        project_id, status, decision = row
+        if status != 'pending':
+            raise core.MemCoreError(f'event {event_id} is not pending (status: {status})')
+        core._require_membership(conn, project_id, actor_agent_id)
+        now = core._now()
+        conn.execute(
+            "UPDATE ingest_event SET status='ignored', "
+            "decision='builtin_memory_mutation_dismissed', "
+            "processed_at=? WHERE id=?",
+            (now, event_id)
+        )
+        core._audit(
+            conn, 'journal_dismiss', actor_agent_id, project_id=project_id,
+            detail={'event_id': event_id, 'previous_decision': decision,
+                    'rationale': str(rationale or '')[:1000]}
+        )
+        conn.execute('COMMIT')
+        return {
+            'event_id': event_id,
+            'status': 'ignored',
+            'decision': 'builtin_memory_mutation_dismissed'
+        }
+    except Exception:
+        try:
+            conn.execute('ROLLBACK')
+        except Exception:
+            pass
+        raise
+
+
+def prune_journal(conn, days=30, statuses=('ignored', 'processed'), project_id=None):
+    """Safely prune historical journal events older than retention cutoff.
+
+    Only events with safe terminal statuses (by default: 'ignored' and 'processed')
+    are pruned. Under no circumstances are 'pending' events pruned.
+    Cascades removal across ingest_derivation and ingest_analysis tables.
+    Returns the number of pruned events.
+    """
+    if days < 0:
+        raise core.MemCoreError('journal retention days must be >= 0')
+    if not statuses:
+        return 0
+    safe_statuses = {'ignored', 'processed', 'failed'}
+    invalid = set(statuses) - safe_statuses
+    if invalid:
+        raise core.MemCoreError(
+            f'cannot prune journal events with status: {", ".join(sorted(invalid))}'
+        )
+    cutoff = core._cutoff(conn, days)
+    placeholders = ','.join('?' for _ in statuses)
+    sql = (
+        f'SELECT id FROM ingest_event '
+        f'WHERE status IN ({placeholders}) AND created_at <= ?'
+    )
+    params = list(statuses) + [cutoff]
+    if project_id is not None:
+        sql += ' AND project_id = ?'
+        params.append(project_id)
+
+    conn.execute('BEGIN IMMEDIATE')
+    try:
+        cur = conn.execute(sql, params)
+        event_ids = [row[0] for row in cur.fetchall()]
+        if not event_ids:
+            conn.execute('COMMIT')
+            return 0
+        for i in range(0, len(event_ids), 500):
+            chunk = event_ids[i:i+500]
+            marks = ','.join('?' for _ in chunk)
+            conn.execute(f'DELETE FROM ingest_derivation WHERE event_id IN ({marks})', chunk)
+            conn.execute(f'DELETE FROM ingest_analysis WHERE event_id IN ({marks})', chunk)
+            conn.execute(f'DELETE FROM ingest_event WHERE id IN ({marks})', chunk)
+        conn.execute('COMMIT')
+        return len(event_ids)
+    except Exception:
+        try:
+            conn.execute('ROLLBACK')
+        except Exception:
+            pass
+        raise

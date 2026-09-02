@@ -450,6 +450,17 @@ def cmd_gc(args):
             for t in tombstones:
                 print(f'    {t[0]} (fingerprint={t[1][:8]}..., reason={t[3]})')
 
+        journal_days = getattr(args, 'journal_days', None)
+        if journal_days is not None:
+            if journal_days < 0:
+                sys.exit('error: journal retention days must be >= 0')
+            cutoff_j = core._cutoff(conn, journal_days)
+            prunable_events = conn.execute(
+                "SELECT COUNT(*) FROM ingest_event WHERE status IN ('ignored','processed') "
+                "AND created_at <= ?", (cutoff_j,)
+            ).fetchone()[0]
+            print(f'  prunable journal events (status in ignored/processed, age >{journal_days}d): {prunable_events}')
+
         if args.apply:
             disabled, purged = core.gc_apply(
                 conn,
@@ -463,6 +474,9 @@ def cmd_gc(args):
             if purged:
                 for tid in purged:
                     print(f'    purged: {tid}')
+            if journal_days is not None:
+                pruned_journal = ingest.prune_journal(conn, days=journal_days)
+                print(f'  journal: {pruned_journal} historical events pruned')
     except (core.MemCoreError, store.StoreError) as e:
         sys.exit(f'error: {e}')
     finally:
@@ -605,6 +619,23 @@ def cmd_journal_analysis_history(args):
         'count': len(history),
         'analyses': history,
     })
+
+
+def cmd_journal_dismiss(args):
+    """Dismiss a pending unresolved journal event (e.g. unresolved mutation)."""
+    conn = _open(args)
+    try:
+        agent_id, exists = _agent_identity_or_exit(conn, args.agent)
+        if not exists:
+            sys.exit(f'error: agent {agent_id} does not exist; create it first')
+        result = ingest.dismiss_unresolved_event(
+            conn, args.event_id, agent_id, rationale=args.rationale
+        )
+    except core.MemCoreError as e:
+        sys.exit(f'error: {e}')
+    finally:
+        conn.close()
+    _out(result)
 
 
 def cmd_import(args):
@@ -957,6 +988,8 @@ def cmd_doctor(args):
         f"unresolved_builtin={report['journal']['unresolved_builtin_mutations']}, "
         f"failed={report['journal']['by_status'].get('failed', 0)}"
     )
+    if report['journal']['unresolved_builtin_mutations'] > 0:
+        print("  hint: pending unresolved built-in mutations detected. Run 'memcore journal-stats' to inspect and 'memcore journal-dismiss <id> --agent <agent>' to resolve.")
     deploy = report['plugin_deployment']
     if not deploy.get('available'):
         print(f"plugin deploy check: unavailable ({deploy.get('error')})")
@@ -1086,6 +1119,8 @@ def main(argv=None):
                    help='inactive unevidenced candidates older than N days are disabled (default 30)')
     p.add_argument('--tombstone-days', type=int, default=90,
                    help='overridden tombstones older than N days are purged (default 90)')
+    p.add_argument('--journal-days', type=int, default=None,
+                   help='processed/ignored journal events older than N days are purged (optional)')
     p.add_argument('--apply', action='store_true',
                    help='perform the sweep (dry-run otherwise)')
     p.set_defaults(func=cmd_gc)
@@ -1122,6 +1157,12 @@ def main(argv=None):
     p.add_argument('event_id')
     p.add_argument('--agent', required=True, help='event owner agent name')
     p.set_defaults(func=cmd_journal_analysis_history)
+
+    p = sub.add_parser('journal-dismiss', help='dismiss pending unresolved built-in mutation or event')
+    p.add_argument('event_id')
+    p.add_argument('--agent', required=True, help='operator agent name')
+    p.add_argument('--rationale', default='operator_dismissed', help='reason for dismissal')
+    p.set_defaults(func=cmd_journal_dismiss)
 
     p = sub.add_parser('import', help='import memories from JSON')
     p.add_argument('--file', required=True, help='JSON file path')

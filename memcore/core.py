@@ -35,13 +35,13 @@ class NotFound(MemCoreError):
     pass
 
 
-# Ã¢â€â‚¬Ã¢â€â‚¬ helpers Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+# ————— helpers ————————————————————————————————————————————————————————————————
 
 def fingerprint(content: str) -> str:
     """Deterministic claim fingerprint: sha256 of normalized (whitespace-collapsed,
-    lowercased) content, truncated to 16 hex chars Ã¢â‚¬â€ matches fixtures._fingerprint."""
-    normalized = ' '.join(content.lower().strip().split())
-    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+    lowercased, NFC-normalized) content, truncated to 16 hex chars — matches fixtures._fingerprint."""
+    normalized = unicodedata.normalize('NFC', ' '.join(content.lower().strip().split()))
+    return hashlib.sha256(normalized.encode('utf-8')).hexdigest()[:16]
 
 
 def _new_id(prefix):
@@ -785,13 +785,12 @@ def superseded_history(conn, memory_id, agent_id):
     return cur.fetchall()
 
 
-# Ã¢â€â‚¬Ã¢â€â‚¬ ops: gc / stats / import Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+# ————————————————————————————————————————————————————————————————————————————————————————
 
 def _cutoff(conn, days):
-    """Cutoff timestamp in sqlite 'YYYY-MM-DD HH:MM:SS' UTC Ã¢â‚¬â€ the format
-    datetime('now') DEFAULTs actually store, so string comparison is exact."""
+    """Cutoff timestamp in sqlite ISO 8601 UTC with Z suffix (migration 0005 contract)."""
     return conn.execute(
-        "SELECT strftime('%Y-%m-%d %H:%M:%S', 'now', ?)", (f'-{days} days',)
+        "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)", (f'-{days} days',)
     ).fetchone()[0]
 
 
