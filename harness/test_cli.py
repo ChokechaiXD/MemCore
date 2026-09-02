@@ -3,6 +3,8 @@ import contextlib
 import io
 import json
 import os
+import pathlib
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -117,6 +119,79 @@ class CliImportTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             cli.main(['--db', missing, 'doctor'])
         self.assertFalse(os.path.exists(missing))
+
+    def _deploy_module(self):
+        repo_root = pathlib.Path(cli.__file__).resolve().parents[1]
+        return cli._load_deploy_module(repo_root / 'scripts' / 'deploy_hermes_plugin.py')
+
+    def _stage_plugin_deployment(self, mutate=None):
+        deploy = self._deploy_module()
+        target = pathlib.Path(self.tmp.name) / 'plugins' / 'memcore'
+        target.mkdir(parents=True, exist_ok=True)
+        for relative in deploy.RUNTIME_FILES:
+            destination = target / pathlib.PurePosixPath(relative)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(
+                deploy.SOURCE_ROOT / pathlib.PurePosixPath(relative), destination
+            )
+        if mutate:
+            mutate(target)
+        return target
+
+    def _run_doctor_with_plugin_env(self, target):
+        # Point HERMES_HOME at a stub home whose config.yaml does not enable
+        # memcore — discovery picks the first root with a config.yaml, so an
+        # empty dir would fall through to the real LOCALAPPDATA Hermes config.
+        hermes_home = pathlib.Path(self.tmp.name) / 'stub-hermes-home'
+        hermes_home.mkdir(exist_ok=True)
+        (hermes_home / 'config.yaml').write_text(
+            'plugins:\n  enabled: []\n', encoding='utf-8'
+        )
+        saved = {
+            key: os.environ.get(key)
+            for key in ('HERMES_HOME', 'MEMCORE_HERMES_PLUGIN_DIR')
+        }
+        os.environ['MEMCORE_HERMES_PLUGIN_DIR'] = str(target)
+        os.environ['HERMES_HOME'] = str(hermes_home)
+        output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(output):
+                cli.main(['--db', self.db, 'doctor'])
+            code = None
+        except SystemExit as exc:
+            code = exc.code
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        return code, output.getvalue()
+
+    def test_doctor_reports_plugin_deployment_in_sync(self):
+        target = self._stage_plugin_deployment()
+        code, output = self._run_doctor_with_plugin_env(target)
+        self.assertIsNone(code)
+        self.assertIn('plugin deploy check: OK', output)
+
+    def test_doctor_fails_on_plugin_deployment_drift(self):
+        def mutate(target):
+            plugin_yaml = target / 'plugin.yaml'
+            plugin_yaml.write_text(
+                plugin_yaml.read_text(encoding='utf-8') + '\n# drift\n',
+                encoding='utf-8',
+            )
+        target = self._stage_plugin_deployment(mutate)
+        code, output = self._run_doctor_with_plugin_env(target)
+        self.assertEqual(code, 1)
+        self.assertIn('plugin deploy check: OUT OF SYNC - plugin.yaml', output)
+
+    def test_doctor_fails_when_plugin_not_installed(self):
+        code, output = self._run_doctor_with_plugin_env(
+            pathlib.Path(self.tmp.name) / 'plugins' / 'absent-memcore'
+        )
+        self.assertEqual(code, 1)
+        self.assertIn('plugin deploy check: NOT INSTALLED', output)
 
     def test_read_commands_do_not_create_missing_store(self):
         cases = [

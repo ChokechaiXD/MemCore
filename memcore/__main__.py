@@ -696,6 +696,47 @@ def cmd_import(args):
 
 # ── doctor ─────────────────────────────────────────────────────────────
 
+def _plugin_deployment_report() -> dict:
+    """Compare the deployed Hermes plugin runtime against the Git source.
+
+    Reuses scripts/deploy_hermes_plugin.py so the runtime file allowlist has
+    exactly one definition. doctor stays healthy when the script cannot be
+    imported (doctor must not depend on repo layout).
+    """
+    try:
+        repo_root = pathlib.Path(__file__).resolve().parents[1]
+        deploy = _load_deploy_module(repo_root / 'scripts' / 'deploy_hermes_plugin.py')
+        target = deploy.default_target()
+        plan = deploy.deployment_plan(target)
+    except Exception as exc:  # noqa: BLE001 - doctor must not crash on this check
+        return {'available': False, 'error': str(exc)}
+
+    if not target.is_dir():
+        return {
+            'available': True,
+            'target': str(target),
+            'missing_plugin': True,
+            'files': plan,
+            'out_of_sync': None,
+        }
+    changed = [item for item in plan if item['state'] != 'same']
+    return {
+        'available': True,
+        'target': str(target),
+        'missing_plugin': False,
+        'files': plan,
+        'out_of_sync': changed or None,
+    }
+
+
+def _load_deploy_module(path: pathlib.Path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('memcore_deploy_helper', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def cmd_doctor(args):
     conn = None
     try:
@@ -867,6 +908,9 @@ def cmd_doctor(args):
 
     conn.close()
 
+    # 9. Deployed Hermes plugin runtime must match the Git source of truth.
+    report['plugin_deployment'] = _plugin_deployment_report()
+
     print(f"integrity: {report['integrity_check']}")
     print(f"foreign-key violations: {report['foreign_key_violations']}")
     print(f"journal mode: {report['journal_mode']}")
@@ -913,6 +957,18 @@ def cmd_doctor(args):
         f"unresolved_builtin={report['journal']['unresolved_builtin_mutations']}, "
         f"failed={report['journal']['by_status'].get('failed', 0)}"
     )
+    deploy = report['plugin_deployment']
+    if not deploy.get('available'):
+        print(f"plugin deploy check: unavailable ({deploy.get('error')})")
+    elif deploy.get('missing_plugin'):
+        print(f"plugin deploy check: NOT INSTALLED ({deploy['target']})")
+    else:
+        drift = deploy.get('out_of_sync')
+        if drift:
+            names = ', '.join(item['relative'] for item in drift)
+            print(f"plugin deploy check: OUT OF SYNC - {names}")
+        else:
+            print(f"plugin deploy check: OK ({deploy['target']})")
 
     unhealthy = (
         report['integrity_check'] != 'ok'
@@ -931,6 +987,8 @@ def cmd_doctor(args):
         or not report['fts_index']['in_sync']
         or report['migration_locks'] != 'none'
         or report['journal']['by_status'].get('failed', 0) > 0
+        or bool(deploy.get('missing_plugin'))
+        or bool(deploy.get('out_of_sync'))
     )
     if unhealthy:
         sys.exit(1)
