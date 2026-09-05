@@ -1,5 +1,20 @@
 # MemCore Hermes Integration
 
+## 0.6.1 — TRSS admission and recall fixes
+
+- Recognize Thai durable signals without requiring whitespace after the verb.
+- Ignore standalone Thai greetings/acknowledgments/test pings before semantic review.
+- Route oversized explicit requests and fenced code to semantic review, not a
+  silently truncated candidate. Reject semantic proposals exceeding 4000 characters
+  before any write; their events remain reviewable.
+- Recall only complete facts that fit the character budget, skipping oversized
+  rows so a later short fact can still fit. The status count reflects rendered
+  facts, not all search hits. Increase `inject.budget_chars` when longer facts
+  are needed; skipped facts are not deleted from the store.
+- No automatic acceptance, verification, cleanup of existing memories, model
+  switch, or raw-JSON fallback was added. Structured-output provider failures
+  still fail closed; this patch does not establish live model reliability.
+
 This directory is the **Git-tracked source of truth** for the MemCore Hermes plugin.
 The copy under the local Hermes plugin directory is a deployed artifact and should
 not be edited directly.

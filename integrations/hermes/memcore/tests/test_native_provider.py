@@ -133,6 +133,18 @@ class NativeProviderTest(unittest.TestCase):
                       p.system_prompt_block())
         self.assertEqual(p.recall_status().count, 2)
 
+    def test_recall_status_counts_only_complete_rendered_facts(self):
+        conn = store.open_store(self.db)
+        for content in ('nebula ' + 'x' * 400, 'nebula short fact'):
+            core.create_memory(conn, 'proj-demo', 'agent-alice', content, scope='project')
+        conn.close()
+        p = self.provider()
+        p._budget = 180
+        out = p.prefetch('nebula')
+        self.assertIn('nebula short fact', out)
+        self.assertNotIn('xxx', out)
+        self.assertEqual(p.recall_status().count, 1)
+
     def test_prefetch_excludes_pinned_duplicate_blocked_by_tombstone(self):
         conn = store.open_store(self.db)
         try:

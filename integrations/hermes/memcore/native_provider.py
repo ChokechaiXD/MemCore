@@ -269,11 +269,9 @@ class MemCoreMemoryProvider(MemoryProvider):
             block = agent_plugin.build_recall_block(
                 pinned, hits, self._budget, self._max_items
             )
-            seen = []
-            for row in list(pinned) + list(hits):
-                if row[0] not in seen:
-                    seen.append(row[0])
-            self._last_recall_count = min(len(seen), self._max_items) if block else 0
+            # Content is whitespace-collapsed by the builder, one complete row
+            # per line. Count rendered facts, not search hits dropped by budget.
+            self._last_recall_count = sum(line.startswith('- [') for line in block.splitlines())
             return block
         finally:
             conn.close()

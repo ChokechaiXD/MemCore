@@ -73,6 +73,16 @@ class SemanticAnalysisTests(unittest.TestCase):
         self.assertEqual(history[0]['verdict'], 'remember')
         self.assertEqual(history[0]['memory_id'], result['memory_id'])
 
+    def test_oversized_semantic_candidate_is_rejected_without_side_effects(self):
+        event_id = self.pending_event()
+        with self.assertRaises(core.MemCoreError):
+            ingest.apply_semantic_analysis(
+                self.conn, event_id, self.alice, analyzer='test', verdict='remember',
+                candidate_content='x' * 4001,
+            )
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM memory').fetchone()[0], 0)
+        self.assertEqual(len(ingest.pending_semantic_events(self.conn, self.project, self.alice)), 1)
+
     def test_ignore_is_terminal_without_memory(self):
         event_id = self.pending_event()
         result = ingest.apply_semantic_analysis(

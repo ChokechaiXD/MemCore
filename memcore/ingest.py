@@ -18,13 +18,15 @@ SEMANTIC_QUEUE_DECISIONS = {'semantic_review_required', 'semantic_deferred'}
 
 _TRIVIAL_RE = re.compile(
     r'^(?:ok|okay|yes|no|thanks|thank you|hi|hey|hello|continue|next|done|'
-    r'โอเค|ครับ|ค่ะ|ขอบคุณ|ต่อ|ต่อเลย|ได้|ดี)[\s!?.…]*$', re.IGNORECASE
+    r'(?:โอเค|ขอบคุณ|สวัสดี|ทดสอบ|เทส|ต่อ|ต่อเลย|ได้|ดี)\s*(?:นะคะ|นะครับ|ค่ะ|ครับ|คะ)?|'
+    r'ครับ|ค่ะ)[\s!?.…]*$', re.IGNORECASE
 )
 _EXPLICIT_MEMORY_RE = re.compile(
     r'(?:^|\b)(?:please\s+)?remember(?:\s+that)?\b|'
     r'\bfrom now on\b|\bi (?:prefer|always use|use)\b|\bwe (?:decided|agreed|chose)\b|'
-    r'(?:^|\s)(?:จำไว้|ช่วยจำ|จำว่า|ต่อไป(?:นี้)?|ฉันชอบ|ผมชอบ|ฉันใช้|ผมใช้|'
-    r'เราตกลง|เราตัดสินใจ)(?:\s|ว่า|:|,|$)', re.IGNORECASE
+    r'(?:^|\s)(?:จำไว้(?:ว่า)?|ช่วยจำ(?:ไว้)?(?:ว่า)?|จำว่า|ต่อไปนี้|'
+    r'ฉันชอบ|ผมชอบ|ฉันใช้|ผมใช้|เราตกลง(?:กัน)?|เราตัดสินใจ(?:กัน)?|'
+    r'ต่อไป(?=\s|ว่า|:|,|$))', re.IGNORECASE
 )
 _LEADING_REMEMBER_RE = re.compile(
     r'^\s*(?:(?:please\s+)?remember(?:\s+that)?|จำไว้(?:ว่า)?|ช่วยจำ(?:ไว้)?(?:ว่า)?|จำว่า)'
@@ -125,7 +127,9 @@ def classify_user_text(text):
         return 'ignore', 'trivial', ''
     if _EXPLICIT_MEMORY_RE.search(text):
         candidate = _LEADING_REMEMBER_RE.sub('', text).strip() or text
-        return 'candidate', 'explicit_durable_signal', candidate[:4000]
+        if len(candidate) > MAX_ANALYSIS_CANDIDATE_CHARS or '```' in candidate:
+            return 'review', 'semantic_review_required', ''
+        return 'candidate', 'explicit_durable_signal', candidate
     return 'review', 'semantic_review_required', ''
 
 
@@ -195,7 +199,9 @@ def apply_semantic_analysis(conn, event_id, agent_id, *, analyzer, verdict,
     """
     analyzer = str(analyzer or '').strip()[:128]
     verdict = str(verdict or '').strip().lower()
-    candidate_content = _clean_text(candidate_content).strip()[:MAX_ANALYSIS_CANDIDATE_CHARS]
+    candidate_content = _clean_text(candidate_content).strip()
+    if len(candidate_content) > MAX_ANALYSIS_CANDIDATE_CHARS:
+        raise core.MemCoreError('semantic candidate exceeds 4000 characters; submit a complete atomic fact')
     rationale = _clean_text(rationale).strip()[:4000]
     metadata = metadata if isinstance(metadata, dict) else {}
     if not analyzer:

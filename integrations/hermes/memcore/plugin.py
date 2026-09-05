@@ -141,7 +141,8 @@ def build_recall_block(pinned_rows, search_rows, budget_chars=1200, max_items=8)
 
     Pinned/critical rows first, then search hits (deduped by memory id).
     One line per item: "- [scope] content". Whole block capped at
-    budget_chars (header included).
+    budget_chars (header included). Oversized items are skipped, never clipped:
+    a missing condition or negation can reverse a memory's meaning.
     """
     seen = set()
     rows = []
@@ -172,10 +173,7 @@ def build_recall_block(pinned_rows, search_rows, budget_chars=1200, max_items=8)
         if remaining <= 0:
             break
         if len(line) > remaining:
-            if remaining > 3:
-                lines.append(line[:remaining - 3].rstrip() + '...')
-                used = budget_chars
-            break
+            continue
         lines.append(line)
         used += separator + len(line)
     if not lines:

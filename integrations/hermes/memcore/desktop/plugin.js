@@ -439,6 +439,6 @@ function register(ctx) {
 export default {
   id: PLUGIN_ID,
   name: PLUGIN_NAME,
-  version: '0.6.0',
+  version: '0.6.1',
   register
 }

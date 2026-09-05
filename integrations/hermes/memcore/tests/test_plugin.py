@@ -181,6 +181,13 @@ class TestRegistrationBridge(unittest.TestCase):
 
 class TestRecallBlock(unittest.TestCase):
 
+    def test_oversized_fact_is_skipped_without_losing_short_following_fact(self):
+        rows = [self.row(1, 'x' * 400), self.row(2, 'Use SQLite only for local tests.')]
+        block = plugin.build_recall_block([], rows, budget_chars=180)
+        self.assertNotIn('xxx', block)
+        self.assertIn('Use SQLite only for local tests.', block)
+        self.assertEqual(block.count('- ['), 1)
+
     @staticmethod
     def row(i, content, scope='project'):
         return (f'mem-{i}', scope, 'accepted', 'source_backed', 'current', content)
@@ -594,7 +601,8 @@ class TestToolsAgainstRealStore(ToolTestBase):
             {'query': 'anything'}, {'config': cfg, 'profile_name': 'sora'}))
         self.assertFalse(out['success'])
         self.assertIn('store open failed', out['error'])
-        self.assertIn('unsupported schema migration version', out['error'])
+        self.assertIn('invalid migration history', out['error'])
+        self.assertIn('9999_future', out['error'])
         self.assertNotIn('run: python -m memcore', out['error'])
 
 
